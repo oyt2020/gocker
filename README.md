@@ -6,7 +6,7 @@
 Go : 1.26.5
 
 ## 외부 패키지
-
+1. github.com/containerd/containerd/v2/client
 
 # 사전 준비
 
