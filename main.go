@@ -6,7 +6,8 @@ import (
 	"log"
 	"os"
 
-	"github.com/containerd/containerd/v2/client" // containerd client 패키지
+	"github.com/containerd/containerd/v2/client"         // containerd client 패키지
+	"github.com/containerd/containerd/v2/pkg/namespaces" // 네임스페이스 패키지
 )
 
 // containerd 소켓 경로
@@ -49,6 +50,8 @@ func main() {
 	switch os.Args[1] {
 	case "version":
 		handleVersion(runtime)
+	case "pull":
+		handlePull(runtime, os.Args[2])
 	default:
 		fmt.Printf("Unknown command: %s\n", os.Args[1])
 		os.Exit(1)
@@ -66,4 +69,13 @@ func handleVersion(r *Runtime) {
 
 	fmt.Printf("containerd version: %s\n", ver.Version)
 	fmt.Printf("containerd Revision: %s\n", ver.Revision)
+}
+
+func handlePull(r *Runtime, ref string) {
+	ctx := namespaces.WithNamespace(context.Background(), "default")
+
+	_, err := r.client.Pull(ctx, ref, client.WithPullUnpack)
+	if err != nil {
+		log.Fatalf("다운로드 실패: %v", err)
+	}
 }
