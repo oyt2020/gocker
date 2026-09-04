@@ -53,6 +53,8 @@ func main() {
 			log.Fatal(err)
 		}
 		handlePull(runtime, imgRef, platform, snapshotter, "default")
+	case "images":
+		handleImages(runtime, "default")
 	default:
 		fmt.Printf("Unknown command: %s\n", os.Args[1])
 		os.Exit(1)
