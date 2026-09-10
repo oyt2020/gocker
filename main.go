@@ -55,6 +55,9 @@ func main() {
 		handlePull(runtime, imgRef, platform, snapshotter, "default")
 	case "images":
 		handleImagesCommand(runtime, os.Args[2:])
+
+	case "run":
+		handleRun(runtime, "default", "test_busybox", "docker.io/library/busybox:latest", []string{"echo", "Hello from Gocker!"})
 	default:
 		fmt.Printf("Unknown command: %s\n", os.Args[1])
 		os.Exit(1)
