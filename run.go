@@ -91,7 +91,13 @@ func handleRun(r *Runtime, ns, containerId, imageRef string, detach, rm, tty boo
 	if detach {
 		ioCreator = cio.NullIO
 	} else {
-		ioCreator = cio.NewCreator(cio.WithStdio)
+		cioOpts := []cio.Opt{cio.WithStdio}
+
+		if tty {
+			cioOpts = append(cioOpts, cio.WithTerminal)
+		}
+
+		ioCreator = cio.NewCreator(cioOpts...)
 	}
 
 	task, err := container.NewTask(ctx, ioCreator)
