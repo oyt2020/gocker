@@ -55,11 +55,11 @@ func main() {
 		handlePull(runtime, imgRef, platform, snapshotter, "default")
 	case "images":
 		handleImagesCommand(runtime, os.Args[2:])
-
 	case "run":
 		handleRunCommand(runtime, os.Args[2:])
 	case "ps":
-		handlePs(runtime, "default", false)
+		handlePsCommand(runtime, os.Args[2:])
+		//handlePs(runtime, "default", false)
 	default:
 		fmt.Printf("Unknown command: %s\n", os.Args[1])
 		os.Exit(1)

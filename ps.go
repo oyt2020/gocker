@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"log"
 	"os"
@@ -11,7 +12,39 @@ import (
 	"github.com/containerd/containerd/v2/pkg/namespaces"
 )
 
-func handlePs(r *Runtime, ns string, all bool) {
+func handlePsCommand(r *Runtime, args []string) {
+	psCmd := flag.NewFlagSet("ps", flag.ExitOnError)
+
+	ns := psCmd.String("ns", "default", "네임스페이스 지정")
+	all := psCmd.Bool("all", false, "모든 컨테이너 프로세스 조회")
+	quite := psCmd.Bool("q", false, "출력 간소화(이름만 출력)")
+
+	psCmd.Usage = func() {
+		fmt.Println("Usage: ps [-all]")
+		fmt.Println("\n컨테이너 프로세스 목록을 출력합니다.")
+		fmt.Println("\nOptions")
+		psCmd.PrintDefaults()
+
+		fmt.Println("\nExamples")
+		fmt.Println(" # Running 상태인 프로세스")
+		fmt.Println(" gocker ps")
+
+		fmt.Println("\n # 모든 상태(Running, Stopped, Exited 등) 조회")
+		fmt.Println(" gocker ps -all")
+
+		fmt.Println("\n # 특정 네임스페이스에서만 조회")
+		fmt.Println(" gocker ps --ns=default")
+
+		fmt.Println("\n # 출력 간소화")
+		fmt.Println(" gocker ps -q")
+	}
+
+	psCmd.Parse(args)
+
+	handlePs(r, *ns, *all, *quite)
+}
+
+func handlePs(r *Runtime, ns string, all bool, quiet bool) {
 	ctx := namespaces.WithNamespace(context.Background(), ns)
 
 	containers, err := r.client.Containers(ctx)
@@ -20,8 +53,12 @@ func handlePs(r *Runtime, ns string, all bool) {
 		log.Fatalf("첫 번째 에러 (컨테이너 조회 실패) %v", err)
 	}
 
-	tw := tabwriter.NewWriter(os.Stdout, 0, 8, 2, ' ', 0)
-	fmt.Fprintln(tw, "CONTAINER ID\tIMAGE\tPID\tSTATUS")
+	var tw *tabwriter.Writer
+
+	if !quiet {
+		tw = tabwriter.NewWriter(os.Stdout, 0, 8, 2, ' ', 0)
+		fmt.Fprintln(tw, "CONTAINER ID\tIMAGE\tPID\tSTATUS")
+	}
 
 	for _, c := range containers {
 
@@ -67,6 +104,11 @@ func handlePs(r *Runtime, ns string, all bool) {
 			continue
 		}
 
+		if quiet {
+			fmt.Println(c.ID())
+			continue
+		}
+
 		imageName := info.Image
 
 		fmt.Fprintf(tw, "%s\t%s\t%d\t%s\n",
@@ -76,5 +118,8 @@ func handlePs(r *Runtime, ns string, all bool) {
 			statusStr,
 		)
 	}
-	tw.Flush()
-}
+
+	if !quiet {
+		tw.Flush()
+	}
+	}
