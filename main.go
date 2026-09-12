@@ -58,6 +58,8 @@ func main() {
 
 	case "run":
 		handleRunCommand(runtime, os.Args[2:])
+	case "ps":
+		handlePs(runtime, "default", false)
 	default:
 		fmt.Printf("Unknown command: %s\n", os.Args[1])
 		os.Exit(1)
