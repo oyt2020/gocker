@@ -60,6 +60,9 @@ func main() {
 	case "ps":
 		handlePsCommand(runtime, os.Args[2:])
 		//handlePs(runtime, "default", false)
+	case "stop":
+		handleStopCommand(runtime, os.Args[2:])
+		//handleStop(runtime, "default", 10, []string{"f9401a0c54b7"})
 	default:
 		fmt.Printf("Unknown command: %s\n", os.Args[1])
 		os.Exit(1)
