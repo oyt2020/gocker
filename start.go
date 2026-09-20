@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"log"
 	"os"
@@ -10,6 +11,37 @@ import (
 	"github.com/containerd/containerd/v2/pkg/cio"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
 )
+
+func handleStartCommand(r *Runtime, args []string) {
+	startCmd := flag.NewFlagSet("start", flag.ExitOnError)
+
+	ns := startCmd.String("ns", "default", "네임스페이스 지정")
+	attach := startCmd.Bool("attach", false, "포그라운드 실행")
+
+	startCmd.Usage = func() {
+		fmt.Println("Usage: gocker start [OPTIONS] CONTAINER [CONTAINER...]")
+		fmt.Println("\n하나 이상의 중지된 컨테이너를 다시 시작합니다.")
+		fmt.Println("\nOptions:")
+		startCmd.PrintDefaults()
+		fmt.Println("\nExamples:")
+		fmt.Println("  # 백그라운드로 다시 시작 (기본)")
+		fmt.Println("  gocker start my-nginx")
+		fmt.Println("\n  # 여러 컨테이너 동시 시작")
+		fmt.Println("  gocker start my-nginx c8a19d3f10be")
+		fmt.Println("\n  # 포그라운드로 실행 화면 연결")
+		fmt.Println("  gocker start -attach my-nginx")
+	}
+
+	startCmd.Parse(args)
+
+	targets := startCmd.Args()
+	if len(targets) < 1 {
+		startCmd.Usage()
+		log.Fatal("중지할 컨테이너 이름을 지정해야 합니다.")
+	}
+
+	handleStart(r, *ns, *attach, targets)
+}
 
 func handleStart(r *Runtime, ns string, attach bool, target []string) {
 
@@ -68,7 +100,7 @@ func handleStart(r *Runtime, ns string, attach bool, target []string) {
 
 		if !attach {
 			fmt.Println(container.ID())
-			return
+			continue
 		}
 
 		statusC, err := newTask.Wait(ctx)
