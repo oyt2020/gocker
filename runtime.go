@@ -9,6 +9,7 @@ import (
 	"github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/pkg/cio"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
+	"github.com/containerd/platforms"
 	"golang.org/x/term"
 )
 
@@ -148,4 +149,55 @@ func (r *Runtime) Exec(
 		ExitCode: code,
 	}, nil
 
+}
+
+type PullOptions struct {
+	Namespace      string
+	TargetPlatform string
+	Snapshotter    string
+}
+
+func (r *Runtime) Pull(
+	ctx context.Context,
+	ref string,
+	opts PullOptions,
+) error {
+	ctx = namespaces.WithNamespace(ctx, opts.Namespace)
+
+	// 이미지 다운로드 받을 때 추가할 옵션 모음
+	// 기본 포함 : 언팩 (압축 해제) -> 이미지를 실행할 계획이면 필수
+	// 기본 포함2 : 메타데이터 -> 다른 플랫폼의 메타데이터도 다운로드
+	pullOpts := []client.RemoteOpt{
+		client.WithPullUnpack,
+		client.WithAllMetadata(),
+	}
+
+	// 추가 옵션 1
+	// 이미지 환경 (linux/amd64, linux/arm64 등)
+	// 미지정 시 현재 컴퓨터의 기본 플랫폼 사용
+	if opts.TargetPlatform != "" {
+		p, err := platforms.Parse(opts.TargetPlatform)
+		if err != nil {
+			return fmt.Errorf("잘못된 플랫폼 형식 %q: %w", opts.TargetPlatform, err)
+		}
+		pullOpts = append(pullOpts, client.WithPlatformMatcher(platforms.Only(p)))
+	} else {
+		pullOpts = append(pullOpts, client.WithPlatformMatcher(platforms.Default()))
+	}
+
+	// 추가 옵션 2
+	// 이미지 파일 시스템 설정 (native, btrfs,stargz 등)
+	// 기본값은 overlayfs
+	if opts.Snapshotter != "" {
+		pullOpts = append(pullOpts, client.WithPullSnapshotter(opts.Snapshotter))
+	}
+
+	_, err := r.client.Pull(ctx, ref, pullOpts...)
+
+	// 에러
+	if err != nil {
+		return fmt.Errorf("이미지 다운로드 실패 %q: %w", ref, err)
+	}
+
+	return nil
 }

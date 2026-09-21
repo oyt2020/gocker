@@ -29,11 +29,10 @@ func main() {
 	case "version":
 		handleVersion(runtime)
 	case "pull":
-		imgRef, platform, snapshotter, err := handlePullCommand(os.Args[2:])
-		if err != nil {
-			log.Fatal(err)
+		if err := handlePullCommand(ctx, runtime, os.Args[2:]); err != nil {
+			log.Printf("gocker: %v\n", err)
+			os.Exit(1)
 		}
-		handlePull(runtime, imgRef, platform, snapshotter, "default")
 	case "images":
 		handleImagesCommand(runtime, os.Args[2:])
 	case "run":
