@@ -34,7 +34,10 @@ func main() {
 			os.Exit(1)
 		}
 	case "images":
-		handleImagesCommand(runtime, os.Args[2:])
+		if err := handleImagesCommand(ctx, runtime, os.Args[2:]); err != nil {
+			log.Printf("gocker: %v\n", err)
+			os.Exit(1)
+		}
 	case "run":
 		handleRunCommand(runtime, os.Args[2:])
 	case "ps":

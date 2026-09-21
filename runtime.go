@@ -5,11 +5,14 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 
 	"github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/core/images"
 	"github.com/containerd/containerd/v2/pkg/cio"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
 	"github.com/containerd/platforms"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"golang.org/x/term"
 )
 
@@ -200,4 +203,119 @@ func (r *Runtime) Pull(
 	}
 
 	return nil
+}
+
+type ImagesOptions struct {
+	Namespace   string
+	ImgName     string
+	ImgPlatform string
+}
+
+type ImageResult struct {
+	Repository     string
+	ImageID        string
+	Size           string
+	PlatformStatus string
+}
+
+func (r *Runtime) Images(
+	ctx context.Context,
+	opts ImagesOptions,
+) ([]ImageResult, error) {
+	ctx = namespaces.WithNamespace(ctx, opts.Namespace)
+
+	imageList, err := r.client.ListImages(ctx)
+
+	if err != nil {
+		return []ImageResult{}, fmt.Errorf("이미지 목록 조회 실패 : %w", err)
+	}
+
+	var targetMatcher platforms.MatchComparer
+	var parsedPlatform ocispec.Platform
+
+	if opts.ImgPlatform != "" {
+		p, err := platforms.Parse(opts.ImgPlatform)
+
+		if err != nil {
+			return []ImageResult{}, fmt.Errorf("잘못된 플랫폼 형식 %q: %w", opts.ImgPlatform, err)
+		}
+		parsedPlatform = p
+		targetMatcher = platforms.Only(p) // 플랫폼 매칭
+	}
+
+	hostPlatform := platforms.DefaultString()
+	cs := r.client.ContentStore()
+	var imgResults []ImageResult
+
+	for _, img := range imageList {
+
+		fullName := img.Name()
+
+		if opts.ImgName != "" {
+			if !strings.Contains(strings.ToLower(fullName), strings.ToLower(opts.ImgName)) {
+				continue
+			}
+		}
+		shortDigest := img.Target().Digest.Hex()
+
+		if len(shortDigest) > 12 {
+			shortDigest = shortDigest[:12]
+		}
+
+		meta := img.Metadata()
+		var sizeStr string
+		var platformStatus string
+
+		if targetMatcher != nil {
+			targetSize, err := meta.Size(ctx, cs, targetMatcher)
+			if err != nil || targetSize == 0 {
+				continue
+			}
+
+			sizeStr = formatBytes(targetSize)
+			if platforms.Format(parsedPlatform) == hostPlatform {
+				platformStatus = fmt.Sprintf("[일치] (호스트 %s)", hostPlatform)
+			} else {
+				platformStatus = fmt.Sprintf("[불일치] (%s / 호스트 : %s)", opts.ImgPlatform, hostPlatform)
+			}
+		} else {
+
+			size, err := img.Size(ctx)
+
+			if err == nil {
+				sizeStr = formatBytes(size)
+				platformStatus = fmt.Sprintf("[일치] (호스트 %s)", hostPlatform)
+			} else {
+
+				sizeStr = "N/A"
+				platformStatus = fmt.Sprintf("[불일치] 호스트(%s)와 다름", hostPlatform)
+
+				children, childErr := images.Children(ctx, cs, img.Target())
+
+				if childErr == nil {
+					for _, child := range children {
+						if child.Platform != nil {
+							if _, infoErr := cs.Info(ctx, child.Digest); infoErr == nil {
+								pMatcher := platforms.Only(*child.Platform)
+								if s, sErr := meta.Size(ctx, cs, pMatcher); sErr == nil && s > 0 {
+									sizeStr = formatBytes(s)
+									platformStatus = fmt.Sprintf("[불일치] 다운로드: %s (호스트 : %s)", platforms.Format(*child.Platform), hostPlatform)
+									break
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+		imgResults = append(imgResults, ImageResult{
+			Repository:     fullName,
+			ImageID:        shortDigest,
+			Size:           sizeStr,
+			PlatformStatus: platformStatus,
+		})
+	}
+
+	return imgResults, nil
+
 }
