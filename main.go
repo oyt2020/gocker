@@ -5,33 +5,14 @@ import (
 	"fmt"
 	"log"
 	"os"
-
-	"github.com/containerd/containerd/v2/client" // containerd client 패키지
 )
 
 // containerd 소켓 경로
 const defaultSocket = "/run/containerd/containerd.sock"
 
-type Runtime struct {
-	client *client.Client
-}
-
-func NewRuntime(socket string) (*Runtime, error) {
-	c, err := client.New(socket)
-	if err != nil {
-		return nil, fmt.Errorf("connect containerd: %w", err) // 래핑된 에러 객체로 반환
-	}
-
-	return &Runtime{
-		client: c,
-	}, nil
-}
-
-func (r *Runtime) Close() error {
-	return r.client.Close()
-}
-
 func main() {
+
+	ctx := context.Background()
 
 	// main 함수에서 단 한 개의 클라이언트 생성
 	runtime, err := NewRuntime(defaultSocket)
@@ -67,7 +48,18 @@ func main() {
 		handleStartCommand(runtime, os.Args[2:])
 		//handleStart(runtime, "default", false, []string{"my_nginx"})
 	case "exec":
-		handleExecCommand(runtime, os.Args[2:])
+		result, err := handleExecCommand(
+			ctx,
+			runtime,
+			os.Args[2:])
+		if err != nil {
+			log.Printf("gocker: %v\n", err)
+			os.Exit(1)
+		}
+
+		if result.ExitCode != 0 {
+			os.Exit(int(result.ExitCode))
+		}
 		//handleExec(runtime, "default", "my_nginx", false, false, []string{"ls", "-al", "/usr/share/nginx/html"})
 	default:
 		fmt.Printf("Unknown command: %s\n", os.Args[1])
