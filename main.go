@@ -66,6 +66,9 @@ func main() {
 	case "start":
 		handleStartCommand(runtime, os.Args[2:])
 		//handleStart(runtime, "default", false, []string{"my_nginx"})
+	case "exec":
+		handleExecCommand(runtime, os.Args[2:])
+		//handleExec(runtime, "default", "my_nginx", false, false, []string{"ls", "-al", "/usr/share/nginx/html"})
 	default:
 		fmt.Printf("Unknown command: %s\n", os.Args[1])
 		os.Exit(1)
