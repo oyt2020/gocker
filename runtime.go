@@ -319,3 +319,85 @@ func (r *Runtime) Images(
 	return imgResults, nil
 
 }
+
+type PsOptions struct {
+	Namespace string
+	All       bool
+}
+
+type PsResult struct {
+	ContainerID string
+	ImageName   string
+	Pid         int64
+	Status      string
+}
+
+func (r *Runtime) Ps(
+	ctx context.Context,
+	opts PsOptions,
+) ([]PsResult, error) {
+	ctx = namespaces.WithNamespace(ctx, opts.Namespace)
+	containers, err := r.client.Containers(ctx)
+
+	if err != nil {
+		return []PsResult{}, fmt.Errorf("컨테이너 조회 실패: %w", err)
+	}
+
+	var psResults []PsResult
+
+	for _, c := range containers {
+
+		info, err := c.Info(ctx)
+		if err != nil {
+			return []PsResult{}, fmt.Errorf("컨테이너 메타데이터 조회 실패: %w", err)
+		}
+
+		task, taskErr := c.Task(ctx, nil)
+		var isRunning bool
+		var statusStr string
+		var pid int64
+
+		if taskErr != nil {
+			isRunning = false
+			statusStr = "Exited"
+			pid = -1
+		} else {
+			status, err := task.Status(ctx)
+			if err == nil {
+				switch status.Status {
+				case client.Running:
+					isRunning = true
+					statusStr = "Running"
+					pid = int64(task.Pid())
+				case client.Stopped:
+					isRunning = false
+					statusStr = "Stopped"
+				case client.Paused:
+					isRunning = true
+					statusStr = "Paused"
+					pid = int64(task.Pid())
+				default:
+					statusStr = string(status.Status)
+				}
+			} else {
+				statusStr = "Unknown"
+			}
+		}
+
+		if !opts.All && !isRunning {
+			continue
+		}
+
+		imageName := info.Image
+
+		psResults = append(psResults, PsResult{
+			ContainerID: c.ID(),
+			ImageName:   imageName,
+			Pid:         pid,
+			Status:      statusStr,
+		})
+	}
+
+	return psResults, nil
+
+}
