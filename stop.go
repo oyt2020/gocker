@@ -4,16 +4,10 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"log"
-	"syscall"
-	"time"
-
-	"github.com/containerd/containerd/v2/client"
-	"github.com/containerd/containerd/v2/pkg/namespaces"
 )
 
-func handleStopCommand(r *Runtime, args []string) {
-	stopCmd := flag.NewFlagSet("stop", flag.ExitOnError)
+func handleStopCommand(ctx context.Context, r *Runtime, args []string) error {
+	stopCmd := flag.NewFlagSet("stop", flag.ContinueOnError)
 
 	ns := stopCmd.String("ns", "default", "네임스페이스 지정")
 	timeoutSec := stopCmd.Int("t", 10, "종료 대기 타임아웃 시간 지정 (단위 초, 기본 값 10초)")
@@ -35,60 +29,33 @@ func handleStopCommand(r *Runtime, args []string) {
 		fmt.Println(" gocker stop -t=5 my_nginx")
 	}
 
-	stopCmd.Parse(args)
+	if err := stopCmd.Parse(args); err != nil {
+		return err
+	}
 
 	targets := stopCmd.Args()
 	if len(targets) < 1 {
-		stopCmd.Usage()
-		log.Fatal("중지할 컨테이너 이름을 지정해야 합니다.")
+		return fmt.Errorf("정지할 컨테이너를 지정해야 합니다. \n 도움말 'gocker stop -h' 확인")
 	}
 
-	handleStop(r, *ns, *timeoutSec, targets)
-}
-
-func handleStop(r *Runtime, ns string, timeoutSec int, targets []string) {
-
-	ctx := namespaces.WithNamespace(context.Background(), ns)
-
-	for _, target := range targets {
-
-		container, err := r.client.LoadContainer(ctx, target)
-
-		if err != nil {
-			log.Fatalf("첫 번째 에러 (컨테이너 찾기 실패) %v", err)
-		}
-
-		task, err := container.Task(ctx, nil)
-		if err != nil {
-			log.Fatalf("두 번째 에러 (Task 찾기 실패) %v", err)
-		}
-
-		status, err := task.Status(ctx)
-		if err == nil && status.Status != client.Running {
-			_, _ = task.Delete(ctx)
-			log.Fatalf("세 번째 에러 (이미 종료된 컨테이너) %v", err)
-		}
-
-		exitStatusC, err := task.Wait(ctx)
-		if err != nil {
-			log.Fatalf("네 번째 에러 (컨테이너 대기 채널 생성 실패) %v", err)
-		}
-
-		if err := task.Kill(ctx, syscall.SIGTERM); err != nil {
-			log.Fatalf("다섯 번째 에러 (SIGTERM 신호 전송 실패) %v", err)
-		}
-
-		select {
-		case <-exitStatusC:
-		case <-time.After(time.Duration(timeoutSec) * time.Second):
-			_ = task.Kill(ctx, syscall.SIGKILL)
-			<-exitStatusC
-		}
-
-		_, _ = task.Delete(ctx)
-
-		fmt.Println(container.ID())
-
+	if *timeoutSec <= 0 {
+		return fmt.Errorf("대기 시간은 1초 이상으로 지정해야 합니다. 현재 지정 시간 : %d", *timeoutSec)
 	}
 
+	opts := StopOptions{
+		Namespace: *ns,
+		Timeout:   *timeoutSec,
+	}
+
+	result, err := r.Stop(ctx, targets, opts)
+
+	if err != nil {
+		return err
+	}
+
+	for _, i := range result.ContainerID {
+		fmt.Println(i)
+	}
+
+	return nil
 }

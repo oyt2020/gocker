@@ -6,6 +6,8 @@ import (
 	"io"
 	"os"
 	"strings"
+	"syscall"
+	"time"
 
 	"github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/core/images"
@@ -399,5 +401,81 @@ func (r *Runtime) Ps(
 	}
 
 	return psResults, nil
+}
+
+type StopOptions struct {
+	Namespace string
+	Timeout   int
+}
+
+type StopResult struct {
+	ContainerID []string
+}
+
+func (r *Runtime) Stop(
+	ctx context.Context,
+	targets []string,
+	opts StopOptions,
+) (StopResult, error) {
+
+	ctx = namespaces.WithNamespace(ctx, opts.Namespace)
+
+	var results []string
+
+	for _, target := range targets {
+
+		container, err := r.client.LoadContainer(ctx, target)
+
+		if err != nil {
+			return StopResult{}, fmt.Errorf("컨테이너 찾기 실패 %q: %w", target, err)
+		}
+
+		task, err := container.Task(ctx, nil)
+		if err != nil {
+			return StopResult{}, fmt.Errorf("task 찾기 실패 %q : %w", target, err)
+		}
+
+		status, err := task.Status(ctx)
+		if err != nil {
+			return StopResult{}, fmt.Errorf("task의 상태 확인 실패 %q : %w", target, err)
+		}
+
+		if status.Status != client.Running {
+			return StopResult{}, fmt.Errorf("task 상태가 실행중이 아님 %q : %s", target, status.Status)
+		}
+
+		exitStatusC, err := task.Wait(ctx)
+		if err != nil {
+			return StopResult{}, fmt.Errorf("컨테이너 대기 채널 생성 실패 %q : %w", target, err)
+		}
+
+		if err := task.Kill(ctx, syscall.SIGTERM); err != nil {
+			return StopResult{}, fmt.Errorf("SIGTERM 신호 전송 실패 %q : %w", target, err)
+		}
+
+		select {
+		case <-exitStatusC:
+		case <-time.After(time.Duration(opts.Timeout) * time.Second):
+			if err := task.Kill(ctx, syscall.SIGKILL); err != nil {
+				return StopResult{}, fmt.Errorf(
+					"SIGKILL 신호 전송 실패 %q : %w",
+					target,
+					err)
+			}
+			<-exitStatusC
+		}
+
+		_, err = task.Delete(ctx)
+
+		if err != nil {
+			return StopResult{}, fmt.Errorf("task 정리 실패 %q : %w", target, err)
+		}
+
+		results = append(results, container.ID())
+
+	}
+	return StopResult{
+		ContainerID: results,
+	}, nil
 
 }

@@ -47,7 +47,12 @@ func main() {
 		}
 		//handlePs(runtime, "default", false)
 	case "stop":
-		handleStopCommand(runtime, os.Args[2:])
+		err := handleStopCommand(ctx, runtime, os.Args[2:])
+
+		if err != nil {
+			log.Printf("gocker: %v\n", err)
+			os.Exit(1)
+		}
 		//handleStop(runtime, "default", 10, []string{"f9401a0c54b7"})
 	case "start":
 		handleStartCommand(runtime, os.Args[2:])
