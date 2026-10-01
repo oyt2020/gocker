@@ -13,6 +13,7 @@ import (
 	"github.com/containerd/containerd/v2/core/images"
 	"github.com/containerd/containerd/v2/pkg/cio"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
+	"github.com/containerd/errdefs"
 	"github.com/containerd/platforms"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"golang.org/x/term"
@@ -476,6 +477,137 @@ func (r *Runtime) Stop(
 	}
 	return StopResult{
 		ContainerID: results,
+	}, nil
+
+}
+
+type StartOptions struct {
+	Namespace string
+	Attach    bool
+}
+
+type StartResult struct {
+	ContainerID []string
+	ExitCode    int64
+}
+
+func (r *Runtime) Start(
+	ctx context.Context,
+	targets []string,
+	opts StartOptions) (StartResult, error) {
+
+	ctx = namespaces.WithNamespace(ctx, opts.Namespace)
+	var results []string
+	var exitCode int64
+
+	for _, target := range targets {
+
+		container, err := r.client.LoadContainer(ctx, target)
+
+		if err != nil {
+			return StartResult{}, fmt.Errorf("컨테이너 찾기 실패 %q: %w", target, err)
+		}
+
+		task, err := container.Task(ctx, nil)
+		if err != nil {
+			if !errdefs.IsNotFound(err) {
+				return StartResult{}, fmt.Errorf("컨테이너로부터 task 확인 실패 %q : %w", target, err)
+			}
+		} else {
+			status, sErr := task.Status(ctx)
+			if sErr != nil {
+				return StartResult{}, fmt.Errorf("task 상태 확인 실패 %q : %w", target, sErr)
+			}
+
+			switch status.Status {
+			case client.Running:
+				return StartResult{}, fmt.Errorf("이미 실행중인 Task %q : %s", target, status.Status)
+			case client.Paused, client.Pausing, client.Unknown, client.Created:
+				return StartResult{}, fmt.Errorf("현재 %s 상태인 Task, start 명령어 적용 불가능 %q", status.Status, target)
+			case client.Stopped:
+				_, err = task.Delete(ctx)
+				if err != nil {
+					return StartResult{}, fmt.Errorf("종료된 Task 정리 실패 %q : %w", target, err)
+				}
+			default:
+				return StartResult{}, fmt.Errorf("처리할 수 없는 Task 상태 %q: %s", target, status.Status)
+			}
+		}
+
+		var ioCreator cio.Creator
+
+		if opts.Attach {
+			spec, specErr := container.Spec(ctx)
+			if specErr != nil {
+				return StartResult{}, fmt.Errorf("spec 조회 실패 %q : %w", target, specErr)
+			}
+
+			cioOpts := []cio.Opt{cio.WithStdio}
+
+			if spec.Process != nil && spec.Process.Terminal {
+				cioOpts = append(cioOpts, cio.WithTerminal)
+			}
+			ioCreator = cio.NewCreator(cioOpts...)
+		} else {
+			ioCreator = cio.NullIO
+		}
+
+		newTask, err := container.NewTask(ctx, ioCreator)
+		shouldCleanup := true
+		if err != nil {
+			return StartResult{}, fmt.Errorf("task 생성 실패 %q : %w", target, err)
+		}
+
+		// 수정 필요, 반복문 안에 defer를 선언하는 것보다 별도 함수를 통해서 그 함수가 cleanup를 처리하도록 (정상 동작은 함)
+		defer func() {
+			if shouldCleanup {
+				_, _ = newTask.Delete(ctx)
+			}
+		}()
+
+		if !opts.Attach {
+
+			if err := newTask.Start(ctx); err != nil {
+				return StartResult{}, fmt.Errorf("task 시작 실패 %q : %w", target, err)
+			}
+			shouldCleanup = false
+			results = append(results, container.ID())
+		} else {
+			statusC, err := newTask.Wait(ctx)
+			if err != nil {
+				return StartResult{}, fmt.Errorf("task 대기 실패 %q : %w", target, err)
+			}
+
+			if err := newTask.Start(ctx); err != nil {
+				return StartResult{}, fmt.Errorf("task 시작 실패 %q : %w", target, err)
+			}
+
+			status := <-statusC
+
+			code, _, err := status.Result()
+
+			if err != nil {
+				return StartResult{}, fmt.Errorf("task 종료 상태 확인 실패 %q : %w", target, err)
+			}
+
+			_, err = newTask.Delete(ctx)
+
+			if err != nil {
+				return StartResult{}, fmt.Errorf("task 정리 실패 %q : %w", target, err)
+			}
+
+			results = append(results, container.ID())
+
+			exitCode = int64(code)
+
+			shouldCleanup = false
+		}
+
+	}
+
+	return StartResult{
+		ContainerID: results,
+		ExitCode:    exitCode,
 	}, nil
 
 }

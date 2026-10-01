@@ -55,7 +55,13 @@ func main() {
 		}
 		//handleStop(runtime, "default", 10, []string{"f9401a0c54b7"})
 	case "start":
-		handleStartCommand(runtime, os.Args[2:])
+
+		err := handleStartCommand(ctx, runtime, os.Args[2:])
+
+		if err != nil {
+			log.Printf("gocker: %v\n", err)
+			os.Exit(1)
+		}
 		//handleStart(runtime, "default", false, []string{"my_nginx"})
 	case "exec":
 		result, err := handleExecCommand(
