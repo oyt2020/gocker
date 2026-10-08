@@ -39,7 +39,11 @@ func main() {
 			os.Exit(1)
 		}
 	case "run":
-		handleRunCommand(runtime, os.Args[2:])
+		if err := handleRunCommand(ctx, runtime, os.Args[2:]); err != nil {
+			log.Printf("gocker: %v\n", err)
+			os.Exit(1)
+		}
+		//handleRunCommand(runtime, os.Args[2:])
 	case "ps":
 		if err := handlePsCommand(ctx, runtime, os.Args[2:]); err != nil {
 			log.Printf("gocker: %v\n", err)

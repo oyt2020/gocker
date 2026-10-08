@@ -15,9 +15,9 @@ import (
 	"github.com/containerd/containerd/v2/pkg/oci"
 )
 
-func handleRunCommand(r *Runtime, args []string) {
+func handleRunCommand(ctx context.Context, r *Runtime, args []string) error {
 
-	runCmd := flag.NewFlagSet("run", flag.ExitOnError)
+	runCmd := flag.NewFlagSet("run", flag.ContinueOnError)
 
 	ns := runCmd.String("ns", "default", "네임스페이스 지정")
 	name := runCmd.String("name", "", "컨테이너 이름 지정")
@@ -27,19 +27,55 @@ func handleRunCommand(r *Runtime, args []string) {
 
 	runCmd.Usage = func() {
 		fmt.Println("Usage: gocker run [OPTIONS] IMAGE [COMMAND] [ARG...]")
+		fmt.Println("\n컨테이너를 생성 및 시작합니다.")
+		fmt.Println(" \n 주의")
+		fmt.Println(" 동시에 하나의 컨테이너만 생성 및 시작할 수 있습니다.")
+		fmt.Println("\nOptions:")
+		runCmd.PrintDefaults()
+		fmt.Println("\nExamples:")
+		fmt.Println("  # 컨테이너 시작 (기본)")
+		fmt.Println("  gocker run -d --name my-nginx docker.io/library/nginx:latest")
+		fmt.Println("  # 포그라운드 일회성 명령어 실행")
+		fmt.Println("  gocker run --rm docker.io/library/busybox:latest echo Hello Gocker")
+		fmt.Println("  # 가상 터미널 할당")
+		fmt.Println("  gocker run -t docker.io/library/nginx:latest sh")
 	}
 
-	runCmd.Parse(args)
+	if err := runCmd.Parse(args); err != nil {
+		return err
+	}
 
 	remainArgs := runCmd.Args()
+
 	if len(remainArgs) < 1 {
-		log.Fatal("에러: 실행할 이미지 이름을 작성해야 합니다.")
+		return fmt.Errorf("실행할 이미지 이름을 지정해야 합니다. \n 도움말 'gocker run -h' 확인")
 	}
 
-	imageRef := remainArgs[0]
+	imgRef := remainArgs[0]
 	cmdArgs := remainArgs[1:]
 
-	handleRun(r, *ns, *name, imageRef, *detach, *rm, *tty, cmdArgs)
+	opts := RunOptions{
+		Namespace:   *ns,
+		ContainerID: *name,
+		ImageRef:    imgRef,
+		Detach:      *detach,
+		Rm:          *rm,
+		TTY:         *tty,
+		Command:     cmdArgs,
+	}
+
+	result, err := r.Run(ctx, opts)
+
+	if err != nil {
+		return err
+	}
+
+	fmt.Println(result.ContainerID)
+	if !*detach {
+		fmt.Printf("종료 코드 %d \n", result.ExitCode)
+	}
+
+	return nil
 
 }
 

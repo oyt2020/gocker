@@ -2,6 +2,9 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -13,6 +16,7 @@ import (
 	"github.com/containerd/containerd/v2/core/images"
 	"github.com/containerd/containerd/v2/pkg/cio"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
+	"github.com/containerd/containerd/v2/pkg/oci"
 	"github.com/containerd/errdefs"
 	"github.com/containerd/platforms"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
@@ -609,5 +613,175 @@ func (r *Runtime) Start(
 		ContainerID: results,
 		ExitCode:    exitCode,
 	}, nil
+
+}
+
+type RunOptions struct {
+	Namespace   string
+	ContainerID string
+	ImageRef    string
+	Detach      bool
+	Rm          bool
+	TTY         bool
+	Command     []string
+}
+
+type RunResult struct {
+	ContainerID string
+	ExitCode    int64
+}
+
+func (r *Runtime) Run(
+	ctx context.Context,
+	opts RunOptions) (RunResult, error) {
+
+	ctx = namespaces.WithNamespace(ctx, opts.Namespace)
+	var exitCode int64
+
+	img, err := r.client.GetImage(ctx, opts.ImageRef)
+	if err != nil {
+		return RunResult{}, fmt.Errorf("이미지 찾기 실패 %q : %w", opts.ImageRef, err)
+	}
+
+	specOpts := []oci.SpecOpts{
+		oci.WithImageConfig(img),
+	}
+
+	// 사용자가 넘긴 명령어 적용
+	if len(opts.Command) > 0 {
+		specOpts = append(specOpts, oci.WithProcessArgs(opts.Command...))
+	}
+
+	// 이름 미지정 시 자동 생성
+	if opts.ContainerID == "" {
+		b := make([]byte, 6)
+		_, _ = rand.Read(b)
+		opts.ContainerID = hex.EncodeToString(b)
+	}
+
+	if opts.TTY {
+		specOpts = append(specOpts, oci.WithTTY)
+	}
+
+	container, err := r.client.NewContainer(
+		ctx,
+		opts.ContainerID,
+		client.WithImage(img),
+		client.WithNewSnapshot(opts.ContainerID, img),
+		client.WithNewSpec(specOpts...),
+	)
+
+	if err != nil {
+		return RunResult{}, fmt.Errorf("컨테이너 생성 실패 %q : %w", opts.ContainerID, err)
+	}
+
+	var ioCreator cio.Creator
+
+	if opts.Detach {
+		ioCreator = cio.NullIO
+	} else {
+		cioOpts := []cio.Opt{cio.WithStdio}
+
+		if opts.TTY {
+			cioOpts = append(cioOpts, cio.WithTerminal)
+		}
+
+		ioCreator = cio.NewCreator(cioOpts...)
+	}
+
+	task, err := container.NewTask(ctx, ioCreator)
+
+	if err != nil {
+		return RunResult{}, fmt.Errorf("task 생성 실패 %q : %w", opts.ContainerID, err)
+	}
+
+	if opts.Detach {
+		// task 시작 실패하면 task 삭제하고, container 데이터도 삭제?
+		if err := task.Start(ctx); err != nil {
+			_, _ = task.Delete(ctx)
+
+			_ = container.Delete(ctx, client.WithSnapshotCleanup)
+
+			return RunResult{}, fmt.Errorf("task 실행 실패 %q : %w", opts.ContainerID, err)
+		}
+
+		if opts.Rm {
+			_ = container.Delete(ctx, client.WithSnapshotCleanup)
+		}
+
+		return RunResult{
+			ContainerID: opts.ContainerID,
+			ExitCode:    exitCode,
+		}, nil
+	}
+
+	code, err := r.startOne(ctx, container, task, opts)
+	if err != nil {
+		return RunResult{}, err
+	}
+
+	if opts.Rm {
+		err := container.Delete(ctx, client.WithSnapshotCleanup)
+
+		if err != nil {
+			return RunResult{}, fmt.Errorf("컨테이너 메타데이터 삭제 실패 %q : %w", opts.ContainerID, err)
+		}
+	}
+
+	return RunResult{
+		ContainerID: opts.ContainerID,
+		ExitCode:    code,
+	}, nil
+
+}
+
+// 포그라운드 일 때 Task 라이프 사이클을 관리하는 함수
+// task wait - task start - task result 순서대로 처리
+// task wait - task start 에서 실패 시 container 메타데이터 + task 삭제
+// task result 에서 실패 시 task 만 삭제
+func (r *Runtime) startOne(ctx context.Context, container client.Container, task client.Task, opts RunOptions) (exitCode int64, retErr error) {
+	shouldContainerCleanup := true
+
+	defer func() {
+
+		if _, taskDeleteErr := task.Delete(ctx); taskDeleteErr != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("task 정리 실패 %q : %w", opts.ContainerID, taskDeleteErr))
+			return
+		}
+
+		if shouldContainerCleanup {
+			containerDeleteErr := container.Delete(ctx, client.WithSnapshotCleanup)
+			if containerDeleteErr != nil {
+				retErr = errors.Join(retErr, fmt.Errorf("컨테이너 메타데이터 Rollback 실패 %q : %w", opts.ContainerID, containerDeleteErr))
+			}
+		}
+
+	}()
+
+	// task 대기 시작
+	statusC, err := task.Wait(ctx)
+	if err != nil {
+		taskWaitErr := fmt.Errorf("task 대기 실패 %q : %w", opts.ContainerID, err)
+		return -1, taskWaitErr
+	}
+
+	// task 시작
+	if err := task.Start(ctx); err != nil {
+
+		taskStartErr := fmt.Errorf("task 시작 실패 %q : %w", opts.ContainerID, err)
+		return -1, taskStartErr
+	}
+
+	// task start는 성공 -> 컨테이너 메타데이터 삭제 필요 x
+	shouldContainerCleanup = false
+
+	// task 종료 수신
+	status := <-statusC
+	code, _, err := status.Result()
+	if err != nil {
+		return -1, fmt.Errorf("task 종료 상태 확인 실패 %q : %w", opts.ContainerID, err)
+	}
+
+	return int64(code), nil
 
 }
