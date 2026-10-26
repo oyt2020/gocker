@@ -7,17 +7,17 @@ import (
 	"github.com/oyt2020/gocker/pkg/util"
 )
 
-// Bundle represents an OCI bundle filesystem layout.
+// OCI Bundle 파일 시스템 레이아웃
 type Bundle struct {
 	ID          string
-	Path        string // Base bundle path (e.g. /var/lib/gocker/containers/<id>)
-	RootFS      string // Root filesystem path (e.g. /var/lib/gocker/containers/<id>/rootfs)
-	ConfigPath  string // Path to config.json
-	MetaPath    string // Path to metadata.json
-	PidFilePath string // Path to container.pid
+	Path        string // 기본 Bundle 디렉터리 경로 (e.g. /var/lib/gocker/containers/<id>)
+	RootFS      string // RootFS 경로 (e.g. /var/lib/gocker/containers/<id>/rootfs)
+	ConfigPath  string // config.json 경로
+	MetaPath    string // metadata.json 경로
+	PidFilePath string // container.pid 경로
 }
 
-// BundleManager defines the lifecycle operations for OCI container bundle directories.
+// BundleManager : Bundle 디렉터리 관리 인터페이스
 type BundleManager interface {
 	Create(id string, rootfsTarPath string) (*Bundle, error)
 	Delete(id string) error
@@ -31,7 +31,7 @@ type bundleManager struct {
 	layout *Layout
 }
 
-// NewBundleManager creates a BundleManager using the specified Layout.
+// NewBundleManager : Layout 구조체를 이용해 BundleManager 생성 및 반환
 func NewBundleManager(layout *Layout) BundleManager {
 	if layout == nil {
 		layout = NewLayout("")
@@ -54,7 +54,7 @@ func (m *bundleManager) bundleFor(id string) *Bundle {
 	}
 }
 
-// Create creates a bundle directory, unpacks the RootFS tarball if specified, and returns the Bundle.
+// Create : bundle 디렉터리 생성 및 RootFS 압축 해제 및 적용
 func (m *bundleManager) Create(id string, rootfsTarPath string) (*Bundle, error) {
 	if id == "" {
 		return nil, fmt.Errorf("container id cannot be empty")
@@ -72,7 +72,7 @@ func (m *bundleManager) Create(id string, rootfsTarPath string) (*Bundle, error)
 
 	if rootfsTarPath != "" {
 		if err := util.ExtractTarGz(rootfsTarPath, b.RootFS); err != nil {
-			_ = os.RemoveAll(b.Path) // Rollback newly created directory on failure
+			_ = os.RemoveAll(b.Path) // 실패 시 롤백
 			return nil, fmt.Errorf("unpack rootfs archive: %w", err)
 		}
 	}
@@ -80,7 +80,7 @@ func (m *bundleManager) Create(id string, rootfsTarPath string) (*Bundle, error)
 	return b, nil
 }
 
-// Delete removes the bundle directory for the specified container ID.
+// Delete : container ID로 Bundle 디렉터리 삭제
 func (m *bundleManager) Delete(id string) error {
 	bDir := m.layout.BundleDir(id)
 	if err := os.RemoveAll(bDir); err != nil {
@@ -89,14 +89,14 @@ func (m *bundleManager) Delete(id string) error {
 	return nil
 }
 
-// Exists checks if a bundle directory exists for the specified container ID.
+// Exists : container ID로 Bundle 디렉터리 존재하는 지 확인
 func (m *bundleManager) Exists(id string) bool {
 	bDir := m.layout.BundleDir(id)
 	fi, err := os.Stat(bDir)
 	return err == nil && fi.IsDir()
 }
 
-// Get returns the Bundle object if the container bundle directory exists.
+// Get : Exists로 Bundle 디렉터리 존재 확인 후 존재하면 Bundle 객체 반환
 func (m *bundleManager) Get(id string) (*Bundle, error) {
 	if !m.Exists(id) {
 		return nil, fmt.Errorf("container %q not found", id)
@@ -104,7 +104,7 @@ func (m *bundleManager) Get(id string) (*Bundle, error) {
 	return m.bundleFor(id), nil
 }
 
-// List returns a list of all existing container bundle IDs.
+// List : 모든 Bundle 디렉터리 ID 목록 반환
 func (m *bundleManager) List() ([]string, error) {
 	cDir := m.layout.ContainersDir()
 	entries, err := os.ReadDir(cDir)
