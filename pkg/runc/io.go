@@ -8,4 +8,5 @@ type IOOption struct {
 	Stdout        io.Writer // FD 1
 	Stderr        io.Writer // FD 2
 	ConsoleSocket string    // Master FD를 받기 위한 유닉스 소켓 경로
+	RuncLogPath   string    // runc --log 옵션에 사용할 진단 로그 파일 경로
 }
