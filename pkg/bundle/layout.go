@@ -25,6 +25,9 @@ const (
 
 	// LogFileName : 컨테이너 표준 출력/에러 로그 저장 파일
 	LogFileName = "container.log"
+
+	// RuncLogFileName : runc 런타임 자체 진단/에러 로그 저장 파일
+	RuncLogFileName = "runc.log"
 )
 
 // Layout : 컨테이너 파일 및 디렉터리 경로 관리
@@ -73,4 +76,9 @@ func (l *Layout) PidFilePath(id string) string {
 // LogFilePath : /var/lib/gocker/containers/<container-id>/container.log 반환
 func (l *Layout) LogFilePath(id string) string {
 	return filepath.Join(l.BundleDir(id), LogFileName)
+}
+
+// RuncLogPath : /var/lib/gocker/containers/<container-id>/runc.log 반환
+func (l *Layout) RuncLogPath(id string) string {
+	return filepath.Join(l.BundleDir(id), RuncLogFileName)
 }
