@@ -15,6 +15,7 @@ type Bundle struct {
 	ConfigPath  string // config.json 경로
 	MetaPath    string // metadata.json 경로
 	PidFilePath string // container.pid 경로
+	LogPath     string // container.log 경로
 }
 
 // BundleManager : Bundle 디렉터리 관리 인터페이스
@@ -51,6 +52,7 @@ func (m *bundleManager) bundleFor(id string) *Bundle {
 		ConfigPath:  m.layout.ConfigPath(id),
 		MetaPath:    m.layout.MetadataPath(id),
 		PidFilePath: m.layout.PidFilePath(id),
+		LogPath:     m.layout.LogFilePath(id),
 	}
 }
 
