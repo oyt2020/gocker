@@ -5,7 +5,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 )
 
@@ -33,7 +35,13 @@ func NewRuncClient(binaryPath string) RuncClient {
 
 // Create : `runc create --bundle <bundleDir> [--pid-file <pidFile>] [--console-socket <sock>] <id>` 명령어 실행
 func (r *runcClient) Create(ctx context.Context, id, bundleDir, pidFile string, ioOpts *IOOption) error {
-	args := []string{"create", "--bundle", bundleDir}
+	runcLogPath := filepath.Join(bundleDir, "runc.log")
+	if ioOpts != nil && ioOpts.RuncLogPath != "" {
+		runcLogPath = ioOpts.RuncLogPath
+	}
+
+	// runc 글로벌 옵션: runc --log <runcLogPath> create ...
+	args := []string{"--log", runcLogPath, "create", "--bundle", bundleDir}
 	if pidFile != "" {
 		args = append(args, "--pid-file", pidFile)
 	}
@@ -43,8 +51,6 @@ func (r *runcClient) Create(ctx context.Context, id, bundleDir, pidFile string, 
 	args = append(args, id)
 
 	cmd := exec.CommandContext(ctx, r.binaryPath, args...)
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
 
 	if ioOpts != nil {
 		if ioOpts.Stdin != nil {
@@ -54,13 +60,17 @@ func (r *runcClient) Create(ctx context.Context, id, bundleDir, pidFile string, 
 			cmd.Stdout = ioOpts.Stdout
 		}
 		if ioOpts.Stderr != nil {
-			// runc 자체 에러 캡처와 외부 stderr 동시 전달
-			cmd.Stderr = &stderr
+			// *os.File을 직접 연결하여 익명 파이프 생성 및 runc init FD 상속 데드락을 원천 방지
+			cmd.Stderr = ioOpts.Stderr
 		}
 	}
 
 	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("runc create failed (%w): %s", err, strings.TrimSpace(stderr.String()))
+		// runc create 실패 시 runc 자체 진단 로그 파일(--log)을 읽어 에러에 포함
+		if logData, readErr := os.ReadFile(runcLogPath); readErr == nil && len(logData) > 0 {
+			return fmt.Errorf("runc create failed (%w): %s", err, strings.TrimSpace(string(logData)))
+		}
+		return fmt.Errorf("runc create failed: %w", err)
 	}
 	return nil
 }
@@ -131,7 +141,12 @@ func (r *runcClient) State(ctx context.Context, id string) (*RuncState, error) {
 
 // Run : `runc run --bundle <bundleDir> [--pid-file <pidFile>] [--console-socket <sock>] <id>` 명령어 실행
 func (r *runcClient) Run(ctx context.Context, id, bundleDir, pidFile string, ioOpts *IOOption) error {
-	args := []string{"run", "--bundle", bundleDir}
+	runcLogPath := filepath.Join(bundleDir, "runc.log")
+	if ioOpts != nil && ioOpts.RuncLogPath != "" {
+		runcLogPath = ioOpts.RuncLogPath
+	}
+
+	args := []string{"--log", runcLogPath, "run", "--bundle", bundleDir}
 	if pidFile != "" {
 		args = append(args, "--pid-file", pidFile)
 	}
@@ -141,24 +156,16 @@ func (r *runcClient) Run(ctx context.Context, id, bundleDir, pidFile string, ioO
 	args = append(args, id)
 
 	cmd := exec.CommandContext(ctx, r.binaryPath, args...)
-	var stderr bytes.Buffer
 
 	if ioOpts != nil {
 		cmd.Stdin = ioOpts.Stdin
 		cmd.Stdout = ioOpts.Stdout
-		if ioOpts.Stderr != nil {
-			cmd.Stderr = ioOpts.Stderr
-		} else {
-			cmd.Stderr = &stderr
-		}
-	} else {
-		cmd.Stderr = &stderr
+		cmd.Stderr = ioOpts.Stderr
 	}
 
 	if err := cmd.Run(); err != nil {
-		errOutput := strings.TrimSpace(stderr.String())
-		if errOutput != "" {
-			return fmt.Errorf("runc run failed (%w): %s", err, errOutput)
+		if logData, readErr := os.ReadFile(runcLogPath); readErr == nil && len(logData) > 0 {
+			return fmt.Errorf("runc run failed (%w): %s", err, strings.TrimSpace(string(logData)))
 		}
 		return fmt.Errorf("runc run failed: %w", err)
 	}
