@@ -356,12 +356,19 @@ func (r *runcRuntime) Run(ctx context.Context, opts RunOptions) (int, error) {
 		return -1, fmt.Errorf("runc create: %w", err)
 	}
 
-	// masterCh 수신 (master fd)
-	res := <-masterCh
+	// masterCh 수신 대기 (타임아웃 및 컨텍스트 취소 방어)
+	var res masterResult
+	select {
+	case res = <-masterCh:
+	case <-ctx.Done():
+		return -1, ctx.Err()
+	case <-time.After(5 * time.Second):
+		return -1, fmt.Errorf("timeout waiting for pty master from runc (5s expired)")
+	}
 	if res.err != nil {
 		return -1, fmt.Errorf("receive pty master: %w", res.err)
 	}
-	ptyMaster := res.file //
+	ptyMaster := res.file
 	defer ptyMaster.Close()
 
 	// 터미널 raw 모드로 전환
@@ -370,15 +377,17 @@ func (r *runcRuntime) Run(ctx context.Context, opts RunOptions) (int, error) {
 		oldState, err := term.MakeRaw(stdinFd)
 		if err == nil {
 			defer term.Restore(stdinFd, oldState)
-		} // defer 4 터미널 표준 모드로 복구
+		} // defer 터미널 표준 모드로 복구
 	}
 
+	stdoutDone := make(chan struct{})
 	// ptyMaster 참조하여 GC 회수 방지
 	go func() {
 		_, _ = io.Copy(ptyMaster, os.Stdin)
 	}()
 	go func() {
 		_, _ = io.Copy(os.Stdout, ptyMaster)
+		close(stdoutDone)
 	}()
 
 	// `runc start` 실행
@@ -387,16 +396,27 @@ func (r *runcRuntime) Run(ctx context.Context, opts RunOptions) (int, error) {
 	}
 
 	// 종료 대기
-	return r.waitForExit(ctx, id)
+	exitCode, exitErr := r.waitForExit(ctx, id)
+
+	// 컨테이너 종료 후 PTY 버퍼에 남은 마지막 로그가 os.Stdout으로 모두 복사될 때까지 드레인 대기
+	select {
+	case <-stdoutDone:
+	case <-time.After(500 * time.Millisecond):
+	}
+
+	return exitCode, exitErr
 }
 
 // waitForExit 컨테이너 종료 확인 함수
 func (r *runcRuntime) waitForExit(ctx context.Context, id string) (int, error) {
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
 			return -1, ctx.Err()
-		case <-time.After(150 * time.Millisecond):
+		case <-ticker.C:
 			state, err := r.runcClient.State(ctx, id)
 			if err != nil || state.Status == runc.StatusStopped {
 				return 0, nil
