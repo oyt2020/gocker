@@ -3,99 +3,31 @@ package main
 import (
 	"context"
 	"fmt"
-	"log"
 	"os"
+
+	"github.com/oyt2020/gocker/pkg/cli"
+	ctd "github.com/oyt2020/gocker/pkg/containerd"
+	"github.com/oyt2020/gocker/pkg/runtime"
 )
 
-// containerd 소켓 경로
-const defaultSocket = "/run/containerd/containerd.sock"
+// containerd 기본 소켓 경로
+const defaultContainerdSocket = "/run/containerd/containerd.sock"
 
 func main() {
-
 	ctx := context.Background()
 
-	// main 함수에서 단 한 개의 클라이언트 생성
-	runtime, err := NewRuntime(defaultSocket)
-	if err != nil {
-		log.Fatal(err) // 에러 출력하고 바로 프로그램 종료
-	}
-	defer runtime.Close()
+	// 1. Phase 2 OCI / runc 기반 독립 런타임 초기화
+	rt := runtime.NewContainerRuntime(nil, nil, nil)
 
-	if len(os.Args) < 2 {
-		fmt.Println("Usage: gocker <command>")
+	// 2. containerd 클라이언트 지연 생성 함수 (pull, images, exec, version 호출 시에만 온디맨드 연결)
+	ctdSupplier := func() (*ctd.Client, error) {
+		return ctd.NewClient(defaultContainerdSocket)
+	}
+
+	dispatcher := cli.NewDispatcher(rt, ctdSupplier)
+
+	if err := dispatcher.Execute(ctx, os.Args[1:]); err != nil {
+		fmt.Fprintf(os.Stderr, "gocker: %v\n", err)
 		os.Exit(1)
 	}
-	switch os.Args[1] {
-	case "version":
-		handleVersion(runtime)
-	case "pull":
-		if err := handlePullCommand(ctx, runtime, os.Args[2:]); err != nil {
-			log.Printf("gocker: %v\n", err)
-			os.Exit(1)
-		}
-	case "images":
-		if err := handleImagesCommand(ctx, runtime, os.Args[2:]); err != nil {
-			log.Printf("gocker: %v\n", err)
-			os.Exit(1)
-		}
-	case "run":
-		if err := handleRunCommand(ctx, runtime, os.Args[2:]); err != nil {
-			log.Printf("gocker: %v\n", err)
-			os.Exit(1)
-		}
-		//handleRunCommand(runtime, os.Args[2:])
-	case "ps":
-		if err := handlePsCommand(ctx, runtime, os.Args[2:]); err != nil {
-			log.Printf("gocker: %v\n", err)
-			os.Exit(1)
-		}
-		//handlePs(runtime, "default", false)
-	case "stop":
-		err := handleStopCommand(ctx, runtime, os.Args[2:])
-
-		if err != nil {
-			log.Printf("gocker: %v\n", err)
-			os.Exit(1)
-		}
-		//handleStop(runtime, "default", 10, []string{"f9401a0c54b7"})
-	case "start":
-
-		err := handleStartCommand(ctx, runtime, os.Args[2:])
-
-		if err != nil {
-			log.Printf("gocker: %v\n", err)
-			os.Exit(1)
-		}
-		//handleStart(runtime, "default", false, []string{"my_nginx"})
-	case "exec":
-		result, err := handleExecCommand(
-			ctx,
-			runtime,
-			os.Args[2:])
-		if err != nil {
-			log.Printf("gocker: %v\n", err)
-			os.Exit(1)
-		}
-
-		if result.ExitCode != 0 {
-			os.Exit(int(result.ExitCode))
-		}
-		//handleExec(runtime, "default", "my_nginx", false, false, []string{"ls", "-al", "/usr/share/nginx/html"})
-	default:
-		fmt.Printf("Unknown command: %s\n", os.Args[1])
-		os.Exit(1)
-	}
-}
-
-// Containerd 버전 출력 함수
-func handleVersion(r *Runtime) {
-	ctx := context.Background()
-
-	ver, err := r.client.Version(ctx)
-	if err != nil {
-		log.Fatalf("failed to get containerd version: %v", err)
-	}
-
-	fmt.Printf("containerd version: %s\n", ver.Version)
-	fmt.Printf("containerd Revision: %s\n", ver.Revision)
 }
