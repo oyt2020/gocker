@@ -74,6 +74,12 @@ func NewContainerRuntime(bm bundle.BundleManager, sb oci.SpecBuilder, rc runc.Ru
 	}
 }
 
+// masterResult PTY Master FD 수신 결과
+type masterResult struct {
+	file *os.File
+	err  error
+}
+
 // Create : `runc create` 명령어 실행 + 번들 디렉터리, config.json 준비
 func (r *runcRuntime) Create(ctx context.Context, opts CreateOptions) (*ContainerMetadata, error) {
 	id := opts.ID
@@ -118,7 +124,7 @@ func (r *runcRuntime) Create(ctx context.Context, opts CreateOptions) (*Containe
 	// 3. I/O 옵션 준비
 	var ioOpts *runc.IOOption
 	var logFile *os.File
-	var masterErrCh chan error
+	var masterCh chan masterResult
 
 	if opts.Terminal {
 		// Terminal (PTY) mode: Master FD를 위한 콘솔 소켓 생성
@@ -133,13 +139,11 @@ func (r *runcRuntime) Create(ctx context.Context, opts CreateOptions) (*Containe
 		}
 
 		// runc가 create 시 전송하는 PTY master fd를 백그라운드에서 수신 대기 (데드락 및 Broken pipe 방지)
-		masterErrCh = make(chan error, 1)
+		// 주의: runc create가 완료되기 전에 master fd를 닫으면 커널이 PTY를 hangup(EIO)시키므로 채널로 전달 후 닫는다.
+		masterCh = make(chan masterResult, 1)
 		go func() {
 			f, err := consoleSock.ReceiveMaster()
-			if f != nil {
-				_ = f.Close() // 단독 create 시에는 runc와의 소켓 핸드셰이크만 완료하고 정상 닫기
-			}
-			masterErrCh <- err
+			masterCh <- masterResult{file: f, err: err}
 		}()
 	} else {
 		// Non-terminal mode: Stdout, Stderr를 container.log 파일로 지정
@@ -170,11 +174,31 @@ func (r *runcRuntime) Create(ctx context.Context, opts CreateOptions) (*Containe
 
 	// 4. `runc create` 호출
 	if err := r.runcClient.Create(ctx, id, b.Path, b.PidFilePath, ioOpts); err != nil {
+		if masterCh != nil {
+			select {
+			case res := <-masterCh:
+				if res.file != nil {
+					_ = res.file.Close()
+				}
+			default:
+			}
+		}
 		return nil, fmt.Errorf("runc create: %w", err)
 	}
-	if masterErrCh != nil {
-		if err := <-masterErrCh; err != nil {
-			return nil, fmt.Errorf("receive pty master during create: %w", err)
+	if masterCh != nil {
+		var res masterResult
+		select {
+		case res = <-masterCh:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(5 * time.Second):
+			return nil, fmt.Errorf("timeout waiting for pty master from runc (5s expired)")
+		}
+		if res.file != nil {
+			defer res.file.Close()
+		}
+		if res.err != nil {
+			return nil, fmt.Errorf("receive pty master during create: %w", res.err)
 		}
 	}
 	rollback.Add(func() error {
@@ -335,11 +359,6 @@ func (r *runcRuntime) Run(ctx context.Context, opts RunOptions) (int, error) {
 		return -1, fmt.Errorf("save config.json: %w", err)
 	}
 
-	// Master FD를 저장하는 구조체 선언
-	type masterResult struct {
-		file *os.File
-		err  error
-	}
 	// masterResult를 수신하는 채널 생성
 	masterCh := make(chan masterResult, 1)
 	go func() {
