@@ -125,6 +125,8 @@ func (r *runcRuntime) Create(ctx context.Context, opts CreateOptions) (*Containe
 	var ioOpts *runc.IOOption
 	var logFile *os.File
 	var masterCh chan masterResult
+	// drainMaster : 실패/타임아웃 경로에서 수신 고루틴이 늦게 전달하는 master fd까지 확실히 회수하여 닫는다.
+	var drainMaster func()
 
 	if opts.Terminal {
 		// Terminal (PTY) mode: Master FD를 위한 콘솔 소켓 생성
@@ -145,6 +147,17 @@ func (r *runcRuntime) Create(ctx context.Context, opts CreateOptions) (*Containe
 			f, err := consoleSock.ReceiveMaster()
 			masterCh <- masterResult{file: f, err: err}
 		}()
+
+		drainMaster = func() {
+			// 리스너를 닫아 AcceptUnix 대기 중인 고루틴을 깨운다 (defer Close와 중복 호출되어도 무해)
+			_ = consoleSock.Close()
+			// 고루틴이 보내는 결과를 non-blocking이 아닌 방식으로 반드시 수신하여 fd 누수를 방지
+			go func() {
+				if res := <-masterCh; res.file != nil {
+					_ = res.file.Close()
+				}
+			}()
+		}
 	} else {
 		// Non-terminal mode: Stdout, Stderr를 container.log 파일로 지정
 		out := opts.Stdout
@@ -174,24 +187,25 @@ func (r *runcRuntime) Create(ctx context.Context, opts CreateOptions) (*Containe
 
 	// 4. `runc create` 호출
 	if err := r.runcClient.Create(ctx, id, b.Path, b.PidFilePath, ioOpts); err != nil {
-		if masterCh != nil {
-			select {
-			case res := <-masterCh:
-				if res.file != nil {
-					_ = res.file.Close()
-				}
-			default:
-			}
+		if drainMaster != nil {
+			drainMaster()
 		}
 		return nil, fmt.Errorf("runc create: %w", err)
 	}
+	// runc create 성공 직후 롤백 등록: 이후 어떤 실패 경로에서도 runc 컨테이너가 고아로 남지 않도록 한다.
+	rollback.Add(func() error {
+		return r.runcClient.Delete(context.Background(), id, true)
+	})
+
 	if masterCh != nil {
 		var res masterResult
 		select {
 		case res = <-masterCh:
 		case <-ctx.Done():
+			drainMaster()
 			return nil, ctx.Err()
 		case <-time.After(5 * time.Second):
+			drainMaster()
 			return nil, fmt.Errorf("timeout waiting for pty master from runc (5s expired)")
 		}
 		if res.file != nil {
@@ -201,9 +215,6 @@ func (r *runcRuntime) Create(ctx context.Context, opts CreateOptions) (*Containe
 			return nil, fmt.Errorf("receive pty master during create: %w", res.err)
 		}
 	}
-	rollback.Add(func() error {
-		return r.runcClient.Delete(context.Background(), id, true)
-	})
 
 	// 4. metadata.json 저장
 	meta := &ContainerMetadata{
