@@ -149,14 +149,12 @@ func (r *runcRuntime) Create(ctx context.Context, opts CreateOptions) (*Containe
 		}()
 
 		drainMaster = func() {
-			// 리스너를 닫아 AcceptUnix 대기 중인 고루틴을 깨운다 (defer Close와 중복 호출되어도 무해)
+			// 리스너와 수락된 연결을 함께 닫아 AcceptUnix / ReadMsgUnix 대기 중인 고루틴을 깨운다
 			_ = consoleSock.Close()
-			// 고루틴이 보내는 결과를 non-blocking이 아닌 방식으로 반드시 수신하여 fd 누수를 방지
-			go func() {
-				if res := <-masterCh; res.file != nil {
-					_ = res.file.Close()
-				}
-			}()
+			// 수신 고루틴이 종료될 때까지 동기적으로 회수하고, 늦게 도착한 fd가 있으면 닫는다
+			if res := <-masterCh; res.file != nil {
+				_ = res.file.Close()
+			}
 		}
 	} else {
 		// Non-terminal mode: Stdout, Stderr를 container.log 파일로 지정

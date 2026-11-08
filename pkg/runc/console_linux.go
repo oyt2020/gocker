@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sync"
 	"syscall"
 )
 
@@ -14,6 +15,10 @@ import (
 type ConsoleSocket struct {
 	path     string
 	listener *net.UnixListener // 서버 측 리스너
+
+	mu     sync.Mutex
+	conn   *net.UnixConn // 수락된 연결 (Close 시 함께 닫아 ReadMsgUnix 대기 해제)
+	closed bool
 }
 
 // NewConsoleSocket : 새로운 ConsoleSocket 인스턴스 생성 (파라미터 : 소켓 파일 경로)
@@ -41,9 +46,21 @@ func (c *ConsoleSocket) Path() string {
 	return c.path
 }
 
-// Close : ConsoleSocket 리스너 닫기 후 삭제
+// Close : ConsoleSocket 리스너 및 수락된 연결을 닫고 소켓 파일 삭제
 func (c *ConsoleSocket) Close() error {
-	_ = c.listener.Close()
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return nil
+	}
+	c.closed = true
+	conn := c.conn
+	c.mu.Unlock()
+
+	_ = c.listener.Close() // AcceptUnix 대기 해제
+	if conn != nil {
+		_ = conn.Close() // ReadMsgUnix 대기 해제
+	}
 	return os.Remove(c.path)
 }
 
@@ -53,7 +70,22 @@ func (c *ConsoleSocket) ReceiveMaster() (*os.File, error) {
 	if err != nil {
 		return nil, fmt.Errorf("accept console connection: %w", err)
 	}
-	defer conn.Close()
+
+	c.mu.Lock()
+	if c.closed { // Accept와 Close 사이 경쟁 방지
+		c.mu.Unlock()
+		_ = conn.Close()
+		return nil, fmt.Errorf("console socket closed")
+	}
+	c.conn = conn
+	c.mu.Unlock()
+
+	defer func() {
+		c.mu.Lock()
+		c.conn = nil
+		c.mu.Unlock()
+		_ = conn.Close()
+	}()
 
 	// Buffer for payload data and out-of-band control messages (SCM_RIGHTS)
 	buf := make([]byte, 1)                    // 소켓에서 수신한 원본 바이트
