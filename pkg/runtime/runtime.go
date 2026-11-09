@@ -242,9 +242,9 @@ func (r *runcRuntime) Start(ctx context.Context, id string) error {
 		return err
 	}
 
-	meta, err := LoadMetadata(b.MetaPath)
+	meta, err := r.Get(ctx, id)
 	if err != nil {
-		return fmt.Errorf("load metadata: %w", err)
+		return fmt.Errorf("get metadata: %w", err)
 	}
 
 	if meta.State == StateRunning {
@@ -460,9 +460,9 @@ func (r *runcRuntime) Stop(ctx context.Context, id string, timeout time.Duration
 		return err
 	}
 
-	meta, err := LoadMetadata(b.MetaPath)
+	meta, err := r.Get(ctx, id)
 	if err != nil {
-		return fmt.Errorf("load metadata: %w", err)
+		return fmt.Errorf("get metadata: %w", err)
 	}
 
 	if meta.State == StateStopped {
@@ -494,13 +494,12 @@ func (r *runcRuntime) Stop(ctx context.Context, id string, timeout time.Duration
 
 // Delete runc 관련 리소스(cgroups 등) 제거 및 번들 디렉터리 제거
 func (r *runcRuntime) Delete(ctx context.Context, id string, force bool) error {
-	b, err := r.bundleMgr.Get(id)
+	meta, err := r.Get(ctx, id)
 	if err != nil {
-		return err
+		return fmt.Errorf("get container %q: %w", id, err)
 	}
 
-	meta, err := LoadMetadata(b.MetaPath)
-	if err == nil && meta.State == StateRunning && !force {
+	if meta.State == StateRunning && !force {
 		return fmt.Errorf("container %q is running, use -f to force remove", id)
 	}
 
@@ -525,11 +524,18 @@ func (r *runcRuntime) Get(ctx context.Context, id string) (*ContainerMetadata, e
 
 	// Sync with runc state if possible
 	if state, err := r.runcClient.State(ctx, id); err == nil {
-		if state.Status == runc.StatusRunning {
+		changed := false
+		if state.Status == runc.StatusRunning && (meta.State != StateRunning || meta.Pid != state.Pid) {
 			meta.State = StateRunning
 			meta.Pid = state.Pid
-		} else if state.Status == runc.StatusStopped {
+			changed = true
+		} else if state.Status == runc.StatusStopped && meta.State != StateStopped {
 			meta.State = StateStopped
+			changed = true
+		}
+
+		if changed {
+			_ = SaveMetadata(meta, b.MetaPath)
 		}
 	}
 
