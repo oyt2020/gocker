@@ -287,6 +287,7 @@ func (r *runcRuntime) Run(ctx context.Context, opts RunOptions) (int, error) {
 		opts.ID = meta.ID
 
 		if err := r.Start(ctx, meta.ID); err != nil {
+			_ = r.Delete(context.Background(), meta.ID, true)
 			return -1, fmt.Errorf("start container: %w", err)
 		}
 		return 0, nil
@@ -316,6 +317,7 @@ func (r *runcRuntime) Run(ctx context.Context, opts RunOptions) (int, error) {
 		opts.ID = meta.ID
 
 		if err := r.Start(ctx, meta.ID); err != nil {
+			_ = r.Delete(context.Background(), meta.ID, true)
 			return -1, fmt.Errorf("start container: %w", err)
 		}
 
@@ -335,6 +337,11 @@ func (r *runcRuntime) Run(ctx context.Context, opts RunOptions) (int, error) {
 		opts.CreateOptions.ID = id
 	}
 
+	rollback := NewRollbackTracker()
+	defer func() {
+		_ = rollback.Rollback()
+	}()
+
 	// Master FD를 위한 콘솔 소켓
 	consoleSock, err := runc.NewConsoleSocket("")
 	if err != nil {
@@ -347,11 +354,9 @@ func (r *runcRuntime) Run(ctx context.Context, opts RunOptions) (int, error) {
 	if err != nil {
 		return -1, fmt.Errorf("create bundle: %w", err)
 	}
-	defer func() {
-		if opts.Remove {
-			_ = r.Delete(context.Background(), id, true)
-		}
-	}() // defer 2 : --rm 플래그가 왔을 때
+	rollback.Add(func() error {
+		return r.bundleMgr.Delete(id)
+	})
 
 	// 2. OCI config.json 생성 및 저장
 	spec, err := r.specBuilder.Build(oci.SpecOptions{
@@ -382,6 +387,23 @@ func (r *runcRuntime) Run(ctx context.Context, opts RunOptions) (int, error) {
 	}
 	if err := r.runcClient.Create(ctx, id, b.Path, b.PidFilePath, ioOpts); err != nil {
 		return -1, fmt.Errorf("runc create: %w", err)
+	}
+	rollback.Add(func() error {
+		return r.runcClient.Delete(context.Background(), id, true)
+	})
+
+	meta := &ContainerMetadata{
+		ID:         id,
+		Name:       opts.Name,
+		CreatedAt:  time.Now().UTC(),
+		Image:      opts.RootfsTarPath,
+		Command:    opts.Command,
+		BundlePath: b.Path,
+		State:      StateCreated,
+		Pid:        0,
+	}
+	if err := SaveMetadata(meta, b.MetaPath); err != nil {
+		return -1, fmt.Errorf("save container metadata: %w", err)
 	}
 
 	// masterCh 수신 대기 (타임아웃 및 컨텍스트 취소 방어)
@@ -422,6 +444,9 @@ func (r *runcRuntime) Run(ctx context.Context, opts RunOptions) (int, error) {
 	if err := r.Start(ctx, id); err != nil {
 		return -1, fmt.Errorf("start container: %w", err)
 	}
+
+	// Start 성공: 롤백 함수 정리 (컨테이너가 RUNNING 상태로 진입함)
+	rollback.Commit()
 
 	// 종료 대기
 	exitCode, exitErr := r.waitForExit(ctx, id)
