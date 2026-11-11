@@ -68,21 +68,25 @@ func (d *Dispatcher) resolveContainerID(ctx context.Context, target string) (str
 		return "", fmt.Errorf("list containers: %w", err)
 	}
 
-	var prefixMatches []*runtime.ContainerMetadata
+	var matches []*runtime.ContainerMetadata
 	for _, c := range containers {
-		if c.ID == target || (c.Name != "" && c.Name == target) {
+		if c.ID == target {
 			return c.ID, nil
 		}
-		if len(target) >= 4 && strings.HasPrefix(c.ID, target) {
-			prefixMatches = append(prefixMatches, c)
+		if (len(target) >= 4 && strings.HasPrefix(c.ID, target)) || (c.Name != "" && c.Name == target) {
+			matches = append(matches, c)
 		}
 	}
 
-	if len(prefixMatches) == 1 {
-		return prefixMatches[0].ID, nil
+	if len(matches) == 1 {
+		return matches[0].ID, nil
 	}
-	if len(prefixMatches) > 1 {
-		return "", fmt.Errorf("ambiguous container ID prefix %q: matched %d containers", target, len(prefixMatches))
+	if len(matches) > 1 {
+		return "", fmt.Errorf(
+			"컨테이너 %q에 일치하는 대상이 %d개입니다. "+
+				"'gocker ps -a'로 ID를 확인한 뒤 전체 컨테이너 ID로 다시 시도하세요",
+			target, len(matches),
+		)
 	}
 
 	return "", fmt.Errorf("container %q not found", target)
