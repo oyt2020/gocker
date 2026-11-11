@@ -553,7 +553,7 @@ func (r *runcRuntime) List(ctx context.Context, all bool) ([]*ContainerMetadata,
 	for _, id := range ids {
 		meta, err := r.Get(ctx, id)
 		if err != nil {
-			continue
+			return nil, fmt.Errorf("컨테이너 %q 조회 실패: %w", id, err)
 		}
 		if all || meta.State == StateRunning {
 			list = append(list, meta)
