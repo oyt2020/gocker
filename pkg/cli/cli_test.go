@@ -11,16 +11,16 @@ import (
 )
 
 type mockRuntime struct {
-	createdOpts  []runtime.CreateOptions
-	startedIDs   []string
-	stoppedIDs   []string
-	deletedIDs   []string
-	runOpts      []runtime.RunOptions
-	containers   []*runtime.ContainerMetadata
-	startErr     error
-	stopErr      error
-	deleteErr    error
-	createErr    error
+	createdOpts []runtime.CreateOptions
+	startedIDs  []string
+	stoppedIDs  []string
+	deletedIDs  []string
+	runOpts     []runtime.RunOptions
+	containers  []*runtime.ContainerMetadata
+	startErr    error
+	stopErr     error
+	deleteErr   error
+	createErr   error
 }
 
 func (m *mockRuntime) Create(ctx context.Context, opts runtime.CreateOptions) (*runtime.ContainerMetadata, error) {
@@ -122,7 +122,7 @@ func TestDispatcher_PsAndLifecycle(t *testing.T) {
 	rt := &mockRuntime{
 		containers: []*runtime.ContainerMetadata{
 			{
-				ID:        "c8a19d3f10be1234567890ab",
+				ID:        "c8a19d3f10be",
 				Name:      "test-box",
 				CreatedAt: time.Now().Add(-10 * time.Second),
 				State:     runtime.StateRunning,
@@ -147,24 +147,68 @@ func TestDispatcher_PsAndLifecycle(t *testing.T) {
 	if err := d.Execute(context.Background(), []string{"stop", "test-box"}); err != nil {
 		t.Fatalf("stop failed: %v", err)
 	}
-	if len(rt.stoppedIDs) != 1 || rt.stoppedIDs[0] != "c8a19d3f10be1234567890ab" {
-		t.Fatalf("expected stopped id c8a19d3f10be1234567890ab, got %v", rt.stoppedIDs)
+	if len(rt.stoppedIDs) != 1 || rt.stoppedIDs[0] != "c8a19d3f10be" {
+		t.Fatalf("expected stopped id c8a19d3f10be, got %v", rt.stoppedIDs)
 	}
 
 	// gocker start test-box
 	if err := d.Execute(context.Background(), []string{"start", "test-box"}); err != nil {
 		t.Fatalf("start failed: %v", err)
 	}
-	if len(rt.startedIDs) != 1 || rt.startedIDs[0] != "c8a19d3f10be1234567890ab" {
-		t.Fatalf("expected started id c8a19d3f10be1234567890ab, got %v", rt.startedIDs)
+	if len(rt.startedIDs) != 1 || rt.startedIDs[0] != "c8a19d3f10be" {
+		t.Fatalf("expected started id c8a19d3f10be, got %v", rt.startedIDs)
 	}
 
 	// gocker rm test-box
 	if err := d.Execute(context.Background(), []string{"rm", "test-box"}); err != nil {
 		t.Fatalf("rm failed: %v", err)
 	}
-	if len(rt.deletedIDs) != 1 || rt.deletedIDs[0] != "c8a19d3f10be1234567890ab" {
-		t.Fatalf("expected deleted id c8a19d3f10be1234567890ab, got %v", rt.deletedIDs)
+	if len(rt.deletedIDs) != 1 || rt.deletedIDs[0] != "c8a19d3f10be" {
+		t.Fatalf("expected deleted id c8a19d3f10be, got %v", rt.deletedIDs)
+	}
+}
+
+func TestDispatcher_ResolveContainerID_SecurityAndAmbiguity(t *testing.T) {
+	rt := &mockRuntime{
+		containers: []*runtime.ContainerMetadata{
+			{
+				ID:    "c8a19d3f10be",
+				Name:  "box-1",
+				State: runtime.StateStopped,
+			},
+			{
+				ID:    "c8a1deadbeef",
+				Name:  "box-2",
+				State: runtime.StateStopped,
+			},
+		},
+	}
+	d := NewDispatcher(rt, nil)
+
+	// 1. Path traversal / non-existent targets must fail without calling Delete
+	for _, target := range []string{".", "..", "../containers", "non-existent"} {
+		if err := d.Execute(context.Background(), []string{"rm", target}); err == nil {
+			t.Fatalf("expected error for rm %q, got nil", target)
+		}
+	}
+	if len(rt.deletedIDs) != 0 {
+		t.Fatalf("expected no deletions for invalid targets, got %v", rt.deletedIDs)
+	}
+
+	// 2. Ambiguous prefix "c8a1" matches both containers -> must return error
+	if err := d.Execute(context.Background(), []string{"rm", "c8a1"}); err == nil {
+		t.Fatalf("expected ambiguous prefix error for 'c8a1', got nil")
+	}
+	if len(rt.deletedIDs) != 0 {
+		t.Fatalf("expected no deletions on ambiguous prefix, got %v", rt.deletedIDs)
+	}
+
+	// 3. Unique prefix "c8a19d" matches only box-1 -> must succeed with canonical ID
+	if err := d.Execute(context.Background(), []string{"rm", "c8a19d"}); err != nil {
+		t.Fatalf("expected rm with unique prefix 'c8a19d' to succeed, got %v", err)
+	}
+	if len(rt.deletedIDs) != 1 || rt.deletedIDs[0] != "c8a19d3f10be" {
+		t.Fatalf("expected canonical ID 'c8a19d3f10be', got %v", rt.deletedIDs)
 	}
 }
 

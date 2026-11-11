@@ -5,6 +5,9 @@ import (
 	"flag"
 	"fmt"
 	"strings"
+
+	"github.com/oyt2020/gocker/pkg/runtime"
+	"github.com/oyt2020/gocker/pkg/util"
 )
 
 func (d *Dispatcher) handleStart(ctx context.Context, args []string) error {
@@ -48,17 +51,39 @@ func (d *Dispatcher) handleStart(ctx context.Context, args []string) error {
 
 // resolveContainerID 컨테이너 이름 또는 짧은 ID를 전체 ID로 변환
 func (d *Dispatcher) resolveContainerID(ctx context.Context, target string) (string, error) {
-	if _, err := d.rt.Get(ctx, target); err == nil {
-		return target, nil
+	if target == "" {
+		return "", fmt.Errorf("container id or name cannot be empty")
 	}
 
-	containers, err := d.rt.List(ctx, true)
-	if err == nil {
-		for _, c := range containers {
-			if c.Name == target || (len(target) >= 4 && strings.HasPrefix(c.ID, target)) {
-				return c.ID, nil
-			}
+	// 1. 정규 12자리 ID 형식인 경우 단건 조회 우선 시도
+	if util.IsValidID(target) {
+		if meta, err := d.rt.Get(ctx, target); err == nil {
+			return meta.ID, nil
 		}
 	}
-	return target, nil
+
+	// 2. 전체 목록에서 이름 또는 ID 접두어 검색
+	containers, err := d.rt.List(ctx, true)
+	if err != nil {
+		return "", fmt.Errorf("list containers: %w", err)
+	}
+
+	var prefixMatches []*runtime.ContainerMetadata
+	for _, c := range containers {
+		if c.ID == target || (c.Name != "" && c.Name == target) {
+			return c.ID, nil
+		}
+		if len(target) >= 4 && strings.HasPrefix(c.ID, target) {
+			prefixMatches = append(prefixMatches, c)
+		}
+	}
+
+	if len(prefixMatches) == 1 {
+		return prefixMatches[0].ID, nil
+	}
+	if len(prefixMatches) > 1 {
+		return "", fmt.Errorf("ambiguous container ID prefix %q: matched %d containers", target, len(prefixMatches))
+	}
+
+	return "", fmt.Errorf("container %q not found", target)
 }
