@@ -454,6 +454,22 @@ func (r *runcRuntime) Run(ctx context.Context, opts RunOptions) (int, error) {
 		close(stdoutDone)
 	}()
 
+	// stopOutput : 출력 고루틴 정리. grace 동안 자연 종료(EIO)를 기다리고, 끝나지 않으면 read deadline으로
+	// 대기 중인 Read를 깨운 뒤 종료를 확인한다. 이미 끝났으면 즉시 반환하므로 여러 번 호출해도 안전하다.
+	stopOutput := func(grace time.Duration) {
+		select {
+		case <-stdoutDone:
+			return
+		case <-time.After(grace):
+		}
+		if err := ptyMaster.SetReadDeadline(time.Now()); err == nil {
+			<-stdoutDone
+		}
+		// deadline 설정 실패(non-pollable fd)면 Read를 깨울 수 없으므로 무한 대기하지 않고 진행한다
+	}
+	// term.Restore보다 나중에 등록 → 먼저 실행(LIFO): 모든 반환 경로에서 "출력 중단 → 터미널 복구 → master Close" 순서 보장
+	defer stopOutput(0)
+
 	// `runc start` 실행
 	if err := r.Start(ctx, id); err != nil {
 		return -1, fmt.Errorf("start container: %w", err)
@@ -468,14 +484,7 @@ func (r *runcRuntime) Run(ctx context.Context, opts RunOptions) (int, error) {
 	// 컨테이너 종료 후 PTY 버퍼에 남은 출력이 os.Stdout으로 모두 복사되기를(EIO 자연 종료) 우선 기다린다.
 	// 시간 내에 끝나지 않으면(slave를 쥔 프로세스가 남아 있는 등) read deadline으로 대기 중인 Read를 깨워
 	// 출력 고루틴이 반드시 종료되도록 한다. master는 non-blocking(netpoller 등록)이라 deadline이 즉시 반영된다.
-	select {
-	case <-stdoutDone:
-	case <-time.After(ptyDrainTimeout):
-		if err := ptyMaster.SetReadDeadline(time.Now()); err == nil {
-			<-stdoutDone
-		}
-		// deadline 설정 실패(non-pollable fd)면 Read를 깨울 수 없으므로 무한 대기하지 않고 진행한다
-	}
+	stopOutput(ptyDrainTimeout)
 
 	return exitCode, exitErr
 }
