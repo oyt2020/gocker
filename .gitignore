@@ -3,5 +3,7 @@
 # Build output
 /gocker
 /gocker_test
+/gocker_phase2
+/gocker_phase2_2
 
 /assets
