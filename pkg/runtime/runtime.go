@@ -74,10 +74,58 @@ func NewContainerRuntime(bm bundle.BundleManager, sb oci.SpecBuilder, rc runc.Ru
 	}
 }
 
+const (
+	// masterRecvTimeout runc create 이후 PTY master fd 수신을 기다리는 최대 시간
+	masterRecvTimeout = 5 * time.Second
+	// ptyDrainTimeout 컨테이너 종료 후 PTY 출력이 자연 종료(EIO)되기를 기다리는 최대 시간
+	ptyDrainTimeout = 500 * time.Millisecond
+)
+
 // masterResult PTY Master FD 수신 결과
 type masterResult struct {
 	file *os.File
 	err  error
+}
+
+// startMasterReceiver : consoleSock에서 PTY master fd를 백그라운드로 수신한다.
+// 반환되는 drain은 결과를 아직 채널에서 꺼내지 않은 경로(실패/타임아웃)에서만 호출해야 한다.
+// 이미 꺼낸 뒤 호출하면 채널이 비어 있어 영구 블로킹된다.
+func startMasterReceiver(consoleSock *runc.ConsoleSocket) (<-chan masterResult, func()) {
+	ch := make(chan masterResult, 1)
+	go func() {
+		f, err := consoleSock.ReceiveMaster()
+		ch <- masterResult{file: f, err: err}
+	}()
+
+	drain := func() {
+		// 리스너와 수락된 연결을 함께 닫아 AcceptUnix / ReadMsgUnix 대기 중인 고루틴을 깨운다
+		_ = consoleSock.Close()
+		// 수신 고루틴이 종료될 때까지 동기적으로 회수하고, 늦게 도착한 fd가 있으면 닫는다
+		if res := <-ch; res.file != nil {
+			_ = res.file.Close()
+		}
+	}
+	return ch, drain
+}
+
+// waitMaster : master fd 수신을 기다린다. ctx 취소 / 타임아웃 시 drain으로 수신 고루틴과 늦게 온 fd를 회수한다.
+func waitMaster(ctx context.Context, ch <-chan masterResult, drain func()) (*os.File, error) {
+	select {
+	case res := <-ch:
+		if res.err != nil {
+			if res.file != nil {
+				_ = res.file.Close()
+			}
+			return nil, res.err
+		}
+		return res.file, nil
+	case <-ctx.Done():
+		drain()
+		return nil, ctx.Err()
+	case <-time.After(masterRecvTimeout):
+		drain()
+		return nil, fmt.Errorf("timeout waiting for pty master from runc (%s expired)", masterRecvTimeout)
+	}
 }
 
 // Create : `runc create` 명령어 실행 + 번들 디렉터리, config.json 준비
@@ -124,7 +172,7 @@ func (r *runcRuntime) Create(ctx context.Context, opts CreateOptions) (*Containe
 	// 3. I/O 옵션 준비
 	var ioOpts *runc.IOOption
 	var logFile *os.File
-	var masterCh chan masterResult
+	var masterCh <-chan masterResult
 	// drainMaster : 실패/타임아웃 경로에서 수신 고루틴이 늦게 전달하는 master fd까지 확실히 회수하여 닫는다.
 	var drainMaster func()
 
@@ -142,20 +190,7 @@ func (r *runcRuntime) Create(ctx context.Context, opts CreateOptions) (*Containe
 
 		// runc가 create 시 전송하는 PTY master fd를 백그라운드에서 수신 대기 (데드락 및 Broken pipe 방지)
 		// 주의: runc create가 완료되기 전에 master fd를 닫으면 커널이 PTY를 hangup(EIO)시키므로 채널로 전달 후 닫는다.
-		masterCh = make(chan masterResult, 1)
-		go func() {
-			f, err := consoleSock.ReceiveMaster()
-			masterCh <- masterResult{file: f, err: err}
-		}()
-
-		drainMaster = func() {
-			// 리스너와 수락된 연결을 함께 닫아 AcceptUnix / ReadMsgUnix 대기 중인 고루틴을 깨운다
-			_ = consoleSock.Close()
-			// 수신 고루틴이 종료될 때까지 동기적으로 회수하고, 늦게 도착한 fd가 있으면 닫는다
-			if res := <-masterCh; res.file != nil {
-				_ = res.file.Close()
-			}
-		}
+		masterCh, drainMaster = startMasterReceiver(consoleSock)
 	} else {
 		// Non-terminal mode: Stdout, Stderr를 container.log 파일로 지정
 		out := opts.Stdout
@@ -196,22 +231,12 @@ func (r *runcRuntime) Create(ctx context.Context, opts CreateOptions) (*Containe
 	})
 
 	if masterCh != nil {
-		var res masterResult
-		select {
-		case res = <-masterCh:
-		case <-ctx.Done():
-			drainMaster()
-			return nil, ctx.Err()
-		case <-time.After(5 * time.Second):
-			drainMaster()
-			return nil, fmt.Errorf("timeout waiting for pty master from runc (5s expired)")
+		master, err := waitMaster(ctx, masterCh, drainMaster)
+		if err != nil {
+			return nil, fmt.Errorf("receive pty master during create: %w", err)
 		}
-		if res.file != nil {
-			defer res.file.Close()
-		}
-		if res.err != nil {
-			return nil, fmt.Errorf("receive pty master during create: %w", res.err)
-		}
+		// gocker는 데몬이 없으므로 master를 유지하지 않는다: Create 종료 시 닫혀 이후 start는 실패한다(의도된 동작)
+		defer master.Close()
 	}
 
 	// 4. metadata.json 저장
@@ -373,12 +398,8 @@ func (r *runcRuntime) Run(ctx context.Context, opts RunOptions) (int, error) {
 		return -1, fmt.Errorf("save config.json: %w", err)
 	}
 
-	// masterResult를 수신하는 채널 생성
-	masterCh := make(chan masterResult, 1)
-	go func() {
-		f, err := consoleSock.ReceiveMaster()       // Master FD 수신
-		masterCh <- masterResult{file: f, err: err} // masterResult 수신 대기
-	}()
+	// Master FD 백그라운드 수신 시작 (drainMaster는 master를 꺼내기 전 실패 경로에서만 호출)
+	masterCh, drainMaster := startMasterReceiver(consoleSock)
 
 	// runc create io 옵션 정의
 	ioOpts := &runc.IOOption{
@@ -386,11 +407,19 @@ func (r *runcRuntime) Run(ctx context.Context, opts RunOptions) (int, error) {
 		RuncLogPath:   b.RuncLogPath,
 	}
 	if err := r.runcClient.Create(ctx, id, b.Path, b.PidFilePath, ioOpts); err != nil {
+		drainMaster()
 		return -1, fmt.Errorf("runc create: %w", err)
 	}
 	rollback.Add(func() error {
 		return r.runcClient.Delete(context.Background(), id, true)
 	})
+
+	// master 수신 (ctx 취소 / 타임아웃 시 waitMaster 내부에서 drain)
+	ptyMaster, err := waitMaster(ctx, masterCh, drainMaster)
+	if err != nil {
+		return -1, fmt.Errorf("receive pty master: %w", err)
+	}
+	defer ptyMaster.Close() // 마지막 정리 지점: 실제 close 시 slave 쪽 hangup
 
 	meta := &ContainerMetadata{
 		ID:         id,
@@ -405,21 +434,6 @@ func (r *runcRuntime) Run(ctx context.Context, opts RunOptions) (int, error) {
 	if err := SaveMetadata(meta, b.MetaPath); err != nil {
 		return -1, fmt.Errorf("save container metadata: %w", err)
 	}
-
-	// masterCh 수신 대기 (타임아웃 및 컨텍스트 취소 방어)
-	var res masterResult
-	select {
-	case res = <-masterCh:
-	case <-ctx.Done():
-		return -1, ctx.Err()
-	case <-time.After(5 * time.Second):
-		return -1, fmt.Errorf("timeout waiting for pty master from runc (5s expired)")
-	}
-	if res.err != nil {
-		return -1, fmt.Errorf("receive pty master: %w", res.err)
-	}
-	ptyMaster := res.file
-	defer ptyMaster.Close()
 
 	// 터미널 raw 모드로 전환
 	stdinFd := int(os.Stdin.Fd())
@@ -451,10 +465,16 @@ func (r *runcRuntime) Run(ctx context.Context, opts RunOptions) (int, error) {
 	// 종료 대기
 	exitCode, exitErr := r.waitForExit(ctx, id)
 
-	// 컨테이너 종료 후 PTY 버퍼에 남은 마지막 로그가 os.Stdout으로 모두 복사될 때까지 드레인 대기
+	// 컨테이너 종료 후 PTY 버퍼에 남은 출력이 os.Stdout으로 모두 복사되기를(EIO 자연 종료) 우선 기다린다.
+	// 시간 내에 끝나지 않으면(slave를 쥔 프로세스가 남아 있는 등) read deadline으로 대기 중인 Read를 깨워
+	// 출력 고루틴이 반드시 종료되도록 한다. master는 non-blocking(netpoller 등록)이라 deadline이 즉시 반영된다.
 	select {
 	case <-stdoutDone:
-	case <-time.After(500 * time.Millisecond):
+	case <-time.After(ptyDrainTimeout):
+		if err := ptyMaster.SetReadDeadline(time.Now()); err == nil {
+			<-stdoutDone
+		}
+		// deadline 설정 실패(non-pollable fd)면 Read를 깨울 수 없으므로 무한 대기하지 않고 진행한다
 	}
 
 	return exitCode, exitErr
