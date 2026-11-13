@@ -109,6 +109,15 @@ func (c *ConsoleSocket) ReceiveMaster() (*os.File, error) {
 				return nil, fmt.Errorf("parse unix rights: %w", err)
 			}
 			if len(fds) > 0 {
+				// 기대하지 않은 추가 fd는 누수되지 않도록 즉시 닫는다
+				for _, extra := range fds[1:] {
+					_ = syscall.Close(extra)
+				}
+				// runc가 보낸 master fd는 blocking 모드를 os.NewFile 전에 non-blocking으로 변경
+				if err := syscall.SetNonblock(fds[0], true); err != nil {
+					_ = syscall.Close(fds[0])
+					return nil, fmt.Errorf("set pty master non-blocking: %w", err)
+				}
 				masterFile := os.NewFile(uintptr(fds[0]), "/dev/ptmx")
 				return masterFile, nil
 			}
