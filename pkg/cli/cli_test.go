@@ -7,6 +7,7 @@ import (
 	"time"
 
 	ctd "github.com/oyt2020/gocker/pkg/containerd"
+	"github.com/oyt2020/gocker/pkg/image"
 	"github.com/oyt2020/gocker/pkg/runtime"
 )
 
@@ -53,9 +54,9 @@ func (m *mockRuntime) Start(ctx context.Context, id string) error {
 	return nil
 }
 
-func (m *mockRuntime) Run(ctx context.Context, opts runtime.RunOptions) (int, error) {
+func (m *mockRuntime) Run(ctx context.Context, opts runtime.RunOptions) (runtime.RunResult, error) {
 	m.runOpts = append(m.runOpts, opts)
-	return 0, nil
+	return runtime.RunResult{ID: "c0ffee000001"}, nil
 }
 
 func (m *mockRuntime) Stop(ctx context.Context, id string, timeout time.Duration) error {
@@ -209,6 +210,60 @@ func TestDispatcher_ResolveContainerID_SecurityAndAmbiguity(t *testing.T) {
 	}
 	if len(rt.deletedIDs) != 1 || rt.deletedIDs[0] != "c8a19d3f10be" {
 		t.Fatalf("expected canonical ID 'c8a19d3f10be', got %v", rt.deletedIDs)
+	}
+}
+
+func TestDispatcher_CreateDelegatesIDAndImage(t *testing.T) {
+	rt := &mockRuntime{}
+	d := NewDispatcher(rt, nil)
+
+	if err := d.Execute(context.Background(), []string{"create", "--name", "box", "alpine", "echo", "hi"}); err != nil {
+		t.Fatalf("create failed: %v", err)
+	}
+	if len(rt.createdOpts) != 1 {
+		t.Fatalf("expected 1 create call, got %d", len(rt.createdOpts))
+	}
+	opts := rt.createdOpts[0]
+	if opts.ID != "" {
+		t.Fatalf("CLI must not generate container ID, got %q", opts.ID)
+	}
+	if opts.RootfsTarPath != image.DefaultRootFS {
+		t.Fatalf("expected rootfs %q, got %q", image.DefaultRootFS, opts.RootfsTarPath)
+	}
+	if len(opts.Command) != 2 || opts.Command[0] != "echo" || opts.Command[1] != "hi" {
+		t.Fatalf("unexpected command %v", opts.Command)
+	}
+}
+
+func TestDispatcher_RunStdioPolicy(t *testing.T) {
+	rt := &mockRuntime{}
+	d := NewDispatcher(rt, nil)
+
+	// detach: 출력 대상을 지정하지 않아야 한다 (런타임이 container.log로 기록)
+	if err := d.Execute(context.Background(), []string{"run", "-d", "alpine", "sleep", "1"}); err != nil {
+		t.Fatalf("run -d failed: %v", err)
+	}
+	// foreground: 현재 프로세스의 stdout/stderr로 연결해야 한다
+	if err := d.Execute(context.Background(), []string{"run", "--rm", "alpine", "echo", "hi"}); err != nil {
+		t.Fatalf("run failed: %v", err)
+	}
+
+	if len(rt.runOpts) != 2 {
+		t.Fatalf("expected 2 run calls, got %d", len(rt.runOpts))
+	}
+	detached, fg := rt.runOpts[0], rt.runOpts[1]
+
+	if detached.ID != "" || fg.ID != "" {
+		t.Fatalf("CLI must not generate container ID")
+	}
+	if detached.Stdout != nil || detached.Stderr != nil || detached.Stdin != nil {
+		t.Fatalf("detached run must not attach stdio, got %+v", detached.CreateOptions)
+	}
+	if fg.Stdout == nil || fg.Stderr == nil {
+		t.Fatalf("foreground run must attach stdout/stderr")
+	}
+	if fg.Stdin != nil {
+		t.Fatalf("non-tty foreground run must not forward stdin")
 	}
 }
 

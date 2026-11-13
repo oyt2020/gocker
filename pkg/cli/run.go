@@ -5,10 +5,10 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"strings"
 
+	"github.com/oyt2020/gocker/pkg/image"
 	"github.com/oyt2020/gocker/pkg/runtime"
-	"github.com/oyt2020/gocker/pkg/util"
+	"golang.org/x/term"
 )
 
 func (d *Dispatcher) handleRun(ctx context.Context, args []string) error {
@@ -20,7 +20,7 @@ func (d *Dispatcher) handleRun(ctx context.Context, args []string) error {
 	tty := runCmd.Bool("t", false, "가상 터미널(TTY) 할당")
 	interactive := runCmd.Bool("i", false, "표준 입력(stdin) 유지")
 	it := runCmd.Bool("it", false, "대화형 가상 터미널 할당 (-i -t)")
-	rootfs := runCmd.String("rootfs", "", "RootFS 아카이브 파일 경로 (기본값: assets/alpine-minirootfs.tar.gz)")
+	rootfs := runCmd.String("rootfs", "", "RootFS 아카이브 파일 경로 (기본값: "+image.DefaultRootFS+")")
 	hostname := runCmd.String("hostname", "", "컨테이너 호스트명 지정")
 
 	runCmd.Usage = func() {
@@ -48,72 +48,68 @@ func (d *Dispatcher) handleRun(ctx context.Context, args []string) error {
 		*interactive = true
 	}
 
-	remainArgs := runCmd.Args()
-
-	rootfsPath := *rootfs
-	var cmdArgs []string
-
-	if rootfsPath != "" {
-		cmdArgs = remainArgs
-	} else if len(remainArgs) > 0 {
-		first := remainArgs[0]
-		if strings.HasSuffix(first, ".tar") || strings.HasSuffix(first, ".tar.gz") || strings.HasSuffix(first, ".tgz") {
-			rootfsPath = first
-			cmdArgs = remainArgs[1:]
-		} else if first == "alpine" || first == "alpine:latest" {
-			rootfsPath = "assets/alpine-minirootfs.tar.gz"
-			cmdArgs = remainArgs[1:]
-		} else if _, err := os.Stat(first); err == nil {
-			rootfsPath = first
-			cmdArgs = remainArgs[1:]
-		} else {
-			rootfsPath = "assets/alpine-minirootfs.tar.gz"
-			cmdArgs = remainArgs
-		}
-	} else {
-		rootfsPath = "assets/alpine-minirootfs.tar.gz"
-	}
-
-	if len(cmdArgs) == 0 {
-		cmdArgs = []string{"/bin/sh"}
-	}
-
-	containerID, err := util.GenerateID()
-	if err != nil {
-		return fmt.Errorf("컨테이너 ID 생성 실패: %w", err)
-	}
+	rootfsPath, cmdArgs := image.ResolveArgs(*rootfs, runCmd.Args())
 
 	opts := runtime.RunOptions{
 		CreateOptions: runtime.CreateOptions{
-			ID:            containerID,
 			Name:          *name,
 			RootfsTarPath: rootfsPath,
 			Command:       cmdArgs,
 			Terminal:      *tty,
 			Hostname:      *hostname,
-			Stdout:        os.Stdout,
-			Stderr:        os.Stderr,
 		},
 		Detach: *detach,
 		Remove: *rm,
-		Stdin:  os.Stdin,
-		Stdout: os.Stdout,
-		Stderr: os.Stderr,
 	}
 
-	exitCode, err := d.rt.Run(ctx, opts)
+	// stdio 연결 정책은 CLI가 결정한다:
+	//   - detach: 출력 대상을 지정하지 않음 → 런타임이 container.log로 기록 (gocker의 stdout을 물고 있지 않도록)
+	//   - foreground: 컨테이너 출력을 현재 터미널로 연결
+	if !*detach {
+		opts.CreateOptions.Stdout = os.Stdout
+		opts.CreateOptions.Stderr = os.Stderr
+		if *tty {
+			opts.Stdin = os.Stdin
+		}
+	}
+
+	// 포그라운드 + TTY: 현재 터미널을 raw 모드로 전환 (키 입력을 컨테이너 PTY로 그대로 전달)
+	// Run은 반환 전에 출력 복사를 끝내므로, 반환 직후의 복구 시점에는 컨테이너 출력이 더 이상 쓰이지 않는다.
+	// 복구는 defer가 아니라 Run 직후 명시적으로 호출한다 (아래 os.Exit는 defer를 실행하지 않음).
+	restore := func() {}
+	if *tty && !*detach {
+		if r, err := makeRawTerminal(os.Stdin); err == nil {
+			restore = r
+		} // 전환 실패 시 raw 모드 없이 진행 (기존 동작 유지)
+	}
+
+	result, err := d.rt.Run(ctx, opts)
+	restore()
 	if err != nil {
 		return err
 	}
 
 	if *detach {
-		fmt.Println(containerID)
+		fmt.Println(result.ID)
 		return nil
 	}
 
-	if exitCode != 0 {
-		os.Exit(exitCode)
+	if result.ExitCode != 0 {
+		os.Exit(result.ExitCode)
 	}
 
 	return nil
+}
+
+// makeRawTerminal : f가 터미널이면 raw 모드로 전환하고 복구 함수를 반환한다 (터미널이 아니면 아무것도 하지 않음)
+func makeRawTerminal(f *os.File) (restore func(), err error) {
+	fd := int(f.Fd())
+	if !term.IsTerminal(fd) {
+		return func() {}, nil
+	}
+	oldState, err := term.MakeRaw(fd)
+	if err != nil {
+		return nil, err
+	}
+	return func() { _ = term.Restore(fd, oldState) }, nil
 }

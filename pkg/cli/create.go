@@ -4,11 +4,9 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"os"
-	"strings"
 
+	"github.com/oyt2020/gocker/pkg/image"
 	"github.com/oyt2020/gocker/pkg/runtime"
-	"github.com/oyt2020/gocker/pkg/util"
 )
 
 func (d *Dispatcher) handleCreate(ctx context.Context, args []string) error {
@@ -16,7 +14,7 @@ func (d *Dispatcher) handleCreate(ctx context.Context, args []string) error {
 
 	name := createCmd.String("name", "", "컨테이너 이름 지정")
 	tty := createCmd.Bool("t", false, "가상 터미널(TTY) 할당")
-	rootfs := createCmd.String("rootfs", "", "RootFS 아카이브 파일 경로 (기본값: assets/alpine-minirootfs.tar.gz)")
+	rootfs := createCmd.String("rootfs", "", "RootFS 아카이브 파일 경로 (기본값: "+image.DefaultRootFS+")")
 	hostname := createCmd.String("hostname", "", "컨테이너 호스트명 지정")
 
 	createCmd.Usage = func() {
@@ -37,43 +35,9 @@ func (d *Dispatcher) handleCreate(ctx context.Context, args []string) error {
 		return err
 	}
 
-	remainArgs := createCmd.Args()
-
-	rootfsPath := *rootfs
-	var cmdArgs []string
-
-	if rootfsPath != "" {
-		cmdArgs = remainArgs
-	} else if len(remainArgs) > 0 {
-		first := remainArgs[0]
-		if strings.HasSuffix(first, ".tar") || strings.HasSuffix(first, ".tar.gz") || strings.HasSuffix(first, ".tgz") {
-			rootfsPath = first
-			cmdArgs = remainArgs[1:]
-		} else if first == "alpine" || first == "alpine:latest" {
-			rootfsPath = "assets/alpine-minirootfs.tar.gz"
-			cmdArgs = remainArgs[1:]
-		} else if _, err := os.Stat(first); err == nil {
-			rootfsPath = first
-			cmdArgs = remainArgs[1:]
-		} else {
-			rootfsPath = "assets/alpine-minirootfs.tar.gz"
-			cmdArgs = remainArgs
-		}
-	} else {
-		rootfsPath = "assets/alpine-minirootfs.tar.gz"
-	}
-
-	if len(cmdArgs) == 0 {
-		cmdArgs = []string{"/bin/sh"}
-	}
-
-	containerID, err := util.GenerateID()
-	if err != nil {
-		return fmt.Errorf("컨테이너 ID 생성 실패: %w", err)
-	}
+	rootfsPath, cmdArgs := image.ResolveArgs(*rootfs, createCmd.Args())
 
 	opts := runtime.CreateOptions{
-		ID:            containerID,
 		Name:          *name,
 		RootfsTarPath: rootfsPath,
 		Command:       cmdArgs,
