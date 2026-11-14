@@ -14,7 +14,6 @@ type Bundle struct {
 	Path        string // 기본 Bundle 디렉터리 경로 (e.g. /var/lib/gocker/containers/<id>)
 	RootFS      string // RootFS 경로 (e.g. /var/lib/gocker/containers/<id>/rootfs)
 	ConfigPath  string // config.json 경로
-	MetaPath    string // metadata.json 경로
 	PidFilePath string // container.pid 경로
 	LogPath     string // container.log 경로
 	RuncLogPath string // runc.log 경로
@@ -55,7 +54,6 @@ func (m *bundleManager) bundleFor(id string) (*Bundle, error) {
 		Path:        m.layout.BundleDir(id),
 		RootFS:      m.layout.RootFSDir(id),
 		ConfigPath:  m.layout.ConfigPath(id),
-		MetaPath:    m.layout.MetadataPath(id),
 		PidFilePath: m.layout.PidFilePath(id),
 		LogPath:     m.layout.LogFilePath(id),
 		RuncLogPath: m.layout.RuncLogPath(id),

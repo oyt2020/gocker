@@ -11,14 +11,14 @@ const (
 	// ContainersDirName : Bundle 디렉터리가 저장되는 디렉터리 이름
 	ContainersDirName = "containers"
 
+	// StateDirName : 컨테이너 메타데이터(레코드, 잠금 파일)가 저장되는 디렉터리 이름. 번들과 분리되어 store 패키지가 소유한다.
+	StateDirName = "state"
+
 	// RootFSDirName : Bundle 디렉터리에 저장되는 RootFS 디렉터리 이름 (OCI Bundle 주요 폴더)
 	RootFSDirName = "rootfs"
 
 	// ConfigFileName : 컨테이너 설정 저장하는 파일 이름 (OCI Bundle 주요 파일)
 	ConfigFileName = "config.json"
-
-	// MetadataFileName : 메타데이터 저장하는 파일 이름
-	MetadataFileName = "metadata.json"
 
 	// PidFileName : PID 저장 파일
 	PidFileName = "container.pid"
@@ -28,9 +28,6 @@ const (
 
 	// RuncLogFileName : runc 런타임 자체 진단/에러 로그 저장 파일
 	RuncLogFileName = "runc.log"
-
-	// LockFileName : 컨테이너 단위 상태 변경 직렬화를 위한 flock 파일 (번들과 함께 삭제됨)
-	LockFileName = ".lock"
 )
 
 // Layout : 컨테이너 파일 및 디렉터리 경로 관리
@@ -51,6 +48,11 @@ func (l *Layout) ContainersDir() string {
 	return filepath.Join(l.rootDir, ContainersDirName)
 }
 
+// StateDir : /var/lib/gocker/state 반환 (메타데이터 저장소 루트)
+func (l *Layout) StateDir() string {
+	return filepath.Join(l.rootDir, StateDirName)
+}
+
 // BundleDir : /var/lib/gocker/containers/<container-id> 반환
 func (l *Layout) BundleDir(id string) string {
 	return filepath.Join(l.ContainersDir(), id)
@@ -66,11 +68,6 @@ func (l *Layout) ConfigPath(id string) string {
 	return filepath.Join(l.BundleDir(id), ConfigFileName)
 }
 
-// MetadataPath : /var/lib/gocker/containers/<container-id>/metadata.json 반환
-func (l *Layout) MetadataPath(id string) string {
-	return filepath.Join(l.BundleDir(id), MetadataFileName)
-}
-
 // PidFilePath : /var/lib/gocker/containers/<container-id>/container.pid 반환
 func (l *Layout) PidFilePath(id string) string {
 	return filepath.Join(l.BundleDir(id), PidFileName)
@@ -84,9 +81,4 @@ func (l *Layout) LogFilePath(id string) string {
 // RuncLogPath : /var/lib/gocker/containers/<container-id>/runc.log 반환
 func (l *Layout) RuncLogPath(id string) string {
 	return filepath.Join(l.BundleDir(id), RuncLogFileName)
-}
-
-// LockPath : /var/lib/gocker/containers/<container-id>/.lock 반환
-func (l *Layout) LockPath(id string) string {
-	return filepath.Join(l.BundleDir(id), LockFileName)
 }
