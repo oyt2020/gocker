@@ -17,7 +17,7 @@ func main() {
 	ctx := context.Background()
 
 	// 1. Phase 2 OCI / runc 기반 독립 런타임 초기화
-	rt := runtime.NewContainerRuntime(nil, nil, nil, nil)
+	rt := runtime.NewContainerRuntime(nil, nil, nil, nil, nil)
 
 	// 2. containerd 클라이언트 지연 생성 함수 (pull, images, exec, version 호출 시에만 온디맨드 연결)
 	ctdSupplier := func() (*ctd.Client, error) {

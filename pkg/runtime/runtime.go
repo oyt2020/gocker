@@ -12,6 +12,7 @@ import (
 
 	"github.com/oyt2020/gocker/pkg/bundle"
 	"github.com/oyt2020/gocker/pkg/oci"
+	"github.com/oyt2020/gocker/pkg/reaper"
 	"github.com/oyt2020/gocker/pkg/runc"
 	"github.com/oyt2020/gocker/pkg/store"
 	"github.com/oyt2020/gocker/pkg/util"
@@ -42,7 +43,9 @@ type RunOptions struct {
 
 // RunResult Run 결과
 type RunResult struct {
-	ID       string // 할당된 컨테이너 ID
+	ID string // 할당된 컨테이너 ID
+	// ExitCode 포그라운드 실행이면 컨테이너 프로세스의 종료 코드 (시그널로 죽었으면 128+시그널 번호).
+	// detach면 0, 종료 코드를 얻지 못하고 실패하면 -1이다.
 	ExitCode int
 }
 
@@ -64,10 +67,11 @@ type runcRuntime struct {
 	specBuilder oci.SpecBuilder
 	runcClient  runc.RuncClient
 	store       store.ContainerStore
+	reaper      reaper.Reaper
 }
 
 // NewContainerRuntime : ContainerRuntime 생성 (nil 인자는 기본 구현 사용)
-func NewContainerRuntime(bm bundle.BundleManager, sb oci.SpecBuilder, rc runc.RuncClient, st store.ContainerStore) ContainerRuntime {
+func NewContainerRuntime(bm bundle.BundleManager, sb oci.SpecBuilder, rc runc.RuncClient, st store.ContainerStore, rp reaper.Reaper) ContainerRuntime {
 	if bm == nil {
 		bm = bundle.NewBundleManager(nil)
 	}
@@ -80,11 +84,15 @@ func NewContainerRuntime(bm bundle.BundleManager, sb oci.SpecBuilder, rc runc.Ru
 	if st == nil {
 		st = store.NewFileStore(bm.Layout().StateDir())
 	}
+	if rp == nil {
+		rp = reaper.New()
+	}
 	return &runcRuntime{
 		bundleMgr:   bm,
 		specBuilder: sb,
 		runcClient:  rc,
 		store:       st,
+		reaper:      rp,
 	}
 }
 
@@ -275,13 +283,8 @@ func (r *runcRuntime) start(ctx context.Context, id string) error {
 		return fmt.Errorf("runc start: %w", err)
 	}
 
-	// 컨테이너 메인 프로세스 PID 가져오기
-	pid := 0
-	if pidData, err := os.ReadFile(r.bundleMgr.Layout().PidFilePath(id)); err == nil {
-		if p, err := strconv.Atoi(strings.TrimSpace(string(pidData))); err == nil {
-			pid = p
-		}
-	}
+	// 컨테이너 메인 프로세스 PID 가져오기 (읽지 못해도 시작은 성공이며, 조회 시 runc 관측 값으로 채워진다)
+	pid, _ := r.initPid(id)
 
 	if err := meta.TransitionTo(StateRunning); err != nil {
 		return err
@@ -290,7 +293,25 @@ func (r *runcRuntime) start(ctx context.Context, id string) error {
 	return r.store.Put(meta)
 }
 
+// initPid : `runc create`가 pid 파일에 기록한 컨테이너 init 프로세스의 (호스트 기준) PID를 읽는다
+func (r *runcRuntime) initPid(id string) (int, error) {
+	path := r.bundleMgr.Layout().PidFilePath(id)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0, fmt.Errorf("read pid file: %w", err)
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil || pid <= 0 {
+		return 0, fmt.Errorf("invalid pid file %s: %q", path, strings.TrimSpace(string(data)))
+	}
+	return pid, nil
+}
+
 // Run : `runc create` + `runc start` 를 동시에 수행
+//
+// 포그라운드(detach가 아님)에서는 컨테이너가 끝날 때까지 기다려 종료 코드를 반환한다. 이를 위해 gocker가
+// child subreaper가 되어 컨테이너 init 프로세스를 입양하고 직접 wait한다 (pkg/reaper 참고).
+// detach에서는 gocker가 컨테이너보다 먼저 종료하므로 종료 코드를 수거할 프로세스가 없다 (데몬/shim이 없는 구조의 한계).
 func (r *runcRuntime) Run(ctx context.Context, opts RunOptions) (RunResult, error) {
 	id, err := ensureID(opts.ID)
 	if err != nil {
@@ -299,6 +320,13 @@ func (r *runcRuntime) Run(ctx context.Context, opts RunOptions) (RunResult, erro
 	opts.ID = id
 	// ID는 생성 단계 이전에 할당되므로 실패 시에도 채워질 수 있다 (해당 컨테이너는 롤백으로 정리됨)
 	result := RunResult{ID: id, ExitCode: -1}
+
+	if !opts.Detach {
+		// 입양은 부모(runc create)가 죽는 시점에 결정되므로 반드시 runc create 이전에 subreaper가 되어야 한다
+		if err := r.reaper.Adopt(); err != nil {
+			return result, fmt.Errorf("become child subreaper: %w", err)
+		}
+	}
 
 	if opts.Remove {
 		defer func() {
@@ -401,22 +429,51 @@ func (r *runcRuntime) runWithTerminal(ctx context.Context, opts RunOptions) (int
 	return exitCode, exitErr
 }
 
-// waitForExit 컨테이너 종료 확인 함수
+// waitForExit : 입양한 컨테이너 init 프로세스가 끝날 때까지 기다려 종료 상태를 수거(reap)하고,
+// 종료 코드를 레코드에 남긴 뒤 반환한다. 호출 전에 reaper.Adopt가 `runc create`보다 먼저 불려 있어야 한다.
+//
+// 컨테이너가 이미 끝났어도 수거 전까지는 좀비로 남아 있으므로 종료 코드를 놓치지 않는다.
+// 종료 코드를 얻었지만 기록에 실패하면 종료 코드와 에러를 함께 반환한다.
 func (r *runcRuntime) waitForExit(ctx context.Context, id string) (int, error) {
-	ticker := time.NewTicker(100 * time.Millisecond)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return -1, ctx.Err()
-		case <-ticker.C:
-			state, err := r.runcClient.State(ctx, id)
-			if err != nil || state.Status == runc.StatusStopped {
-				return 0, nil
-			}
-		}
+	pid, err := r.initPid(id)
+	if err != nil {
+		return -1, fmt.Errorf("find container process: %w", err)
 	}
+
+	exitCode, err := r.reaper.Wait(ctx, pid)
+	if err != nil {
+		return -1, fmt.Errorf("wait container process: %w", err)
+	}
+
+	if err := r.recordExit(id, exitCode); err != nil {
+		return exitCode, fmt.Errorf("record exit code: %w", err)
+	}
+	return exitCode, nil
+}
+
+// recordExit : 수거한 종료 코드를 레코드에 남기고 STOPPED로 전환한다.
+// 기다리는 사이 다른 gocker 프로세스가 컨테이너를 삭제했다면 남길 곳이 없으므로 아무것도 하지 않는다.
+func (r *runcRuntime) recordExit(id string, exitCode int) error {
+	unlock, err := r.store.Lock(id)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
+	meta, err := r.store.Get(id)
+	if errors.Is(err, store.ErrNotFound) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+
+	// RUNNING → STOPPED. 그 사이 stop이 먼저 STOPPED로 바꿨어도(같은 상태로의 전환) 종료 코드는 채운다.
+	if err := meta.TransitionTo(StateStopped); err != nil {
+		return err
+	}
+	meta.ExitCode = &exitCode
+	return r.store.Put(meta)
 }
 
 // stop : `runc stop` 최초 신호는 SIGTERM 시간 초과하면 SIGKILL 신호 전송

@@ -37,6 +37,22 @@ expect_contains() {
   fi
 }
 
+# expect_exit <설명> <기대 종료 코드> <명령...> : 명령이 정확히 그 종료 코드로 끝나야 한다
+expect_exit() {
+  local desc="$1" want="$2"; shift 2
+  n=$((n + 1))
+  local log="$TMP/$n.log"
+  timeout 60 "$@" >"$log" 2>&1
+  local rc=$?
+  if [ $rc -eq "$want" ]; then
+    echo "PASS  $desc"
+  else
+    echo "FAIL  $desc (exit=$rc, 기대=$want)"
+    echo "::group::$desc 출력"; cat "$log"; echo "::endgroup::"
+    FAILED+=("$desc  ->  $* (exit=$rc, 기대=$want)")
+  fi
+}
+
 # --- 1. create → start → stop → rm ---
 run_case "create" $GOCKER create alpine sleep 300
 CID=$LAST_OUT
@@ -59,6 +75,31 @@ expect_contains "run 포그라운드 --rm" "hello" $GOCKER run --rm alpine echo 
 # --- 4. run -t (포그라운드 + 가상 터미널) --rm ---
 # CI에는 실제 TTY가 없으므로 script(1)로 PTY를 붙여 터미널 경로를 검증한다
 expect_contains "run -t 포그라운드 --rm" "tty-ok" script -qec "$GOCKER run -t --rm alpine echo tty-ok" /dev/null
+
+# --- 5. 포그라운드 run 종료 코드 전파 (subreaper + wait) ---
+expect_exit "run 종료 코드 전파" 7 $GOCKER run --rm alpine sh -c 'exit 7'
+expect_exit "run -t 종료 코드 전파" 9 script -qec "$GOCKER run -t --rm alpine sh -c 'exit 9'" /dev/null
+
+# 시그널로 죽은 컨테이너는 128+시그널 번호. 포그라운드 run을 백그라운드 잡으로 띄우고 밖에서 stop한다.
+# sleep은 컨테이너의 PID 1이라 SIGTERM을 무시하므로 타임아웃 뒤 SIGKILL(9)로 종료된다 → 137
+$GOCKER run --name e2e-sig alpine sleep 300 >"$TMP/sig.log" 2>&1 &
+SIG_JOB=$!
+for _ in $(seq 1 50); do
+  $GOCKER ps | grep -q e2e-sig && break
+  sleep 0.1
+done
+run_case "포그라운드 컨테이너 stop" $GOCKER stop -t 1 e2e-sig
+wait $SIG_JOB
+SIG_RC=$?
+n=$((n + 1))
+if [ $SIG_RC -eq 137 ]; then
+  echo "PASS  run 시그널 종료 코드 (SIGKILL=137)"
+else
+  echo "FAIL  run 시그널 종료 코드 (exit=$SIG_RC, 기대=137)"
+  echo "::group::run 출력"; cat "$TMP/sig.log"; echo "::endgroup::"
+  FAILED+=("run 시그널 종료 코드  ->  exit=$SIG_RC, 기대=137")
+fi
+run_case "포그라운드 컨테이너 rm" $GOCKER rm e2e-sig
 
 # --- 결과 ---
 echo

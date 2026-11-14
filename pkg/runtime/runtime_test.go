@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -61,6 +62,42 @@ type fakeRunc struct {
 	output    string // start 시 컨테이너가 터미널에 쓰는 출력
 	console   *fakeConsole
 	deleted   []string
+	onCreate  func() // Create 진입 시 호출 (호출 순서 검증용)
+}
+
+// fakeInitPid : fakeRunc.Create가 pid 파일에 기록하는 컨테이너 init PID
+const fakeInitPid = 4242
+
+// fakeReaper : 실제 프로세스 없이 종료 코드를 돌려주는 reaper.Reaper
+type fakeReaper struct {
+	mu       sync.Mutex
+	adopted  int
+	waited   []int // Wait가 호출된 pid
+	exitCode int
+	waitErr  error
+}
+
+func (f *fakeReaper) Adopt() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.adopted++
+	return nil
+}
+
+func (f *fakeReaper) Wait(ctx context.Context, pid int) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.waited = append(f.waited, pid)
+	if f.waitErr != nil {
+		return -1, f.waitErr
+	}
+	return f.exitCode, nil
+}
+
+func (f *fakeReaper) adoptCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.adopted
 }
 
 func newFakeRunc() *fakeRunc {
@@ -77,8 +114,17 @@ func (f *fakeRunc) NewConsole() (runc.Console, error) {
 func (f *fakeRunc) Create(ctx context.Context, id, bundleDir, pidFile string, ioOpts *runc.IOOption) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.onCreate != nil {
+		f.onCreate()
+	}
 	if f.createErr != nil {
 		return f.createErr
+	}
+	// 실제 runc create처럼 컨테이너 init PID를 pid 파일에 기록한다
+	if pidFile != "" {
+		if err := os.WriteFile(pidFile, []byte(strconv.Itoa(fakeInitPid)), 0644); err != nil {
+			return err
+		}
 	}
 	if ioOpts != nil && ioOpts.ConsoleSocket != "" {
 		r, w, err := os.Pipe()
@@ -143,6 +189,7 @@ func (f *fakeRunc) Run(ctx context.Context, id, bundleDir, pidFile string, ioOpt
 type testEnv struct {
 	rt     ContainerRuntime
 	runc   *fakeRunc
+	reaper *fakeReaper
 	bundle bundle.BundleManager
 	store  store.ContainerStore
 	layout *bundle.Layout
@@ -154,9 +201,11 @@ func newTestEnv(t *testing.T) *testEnv {
 	bm := bundle.NewBundleManager(layout)
 	st := store.NewFileStore(layout.StateDir())
 	fr := newFakeRunc()
+	rp := &fakeReaper{}
 	return &testEnv{
-		rt:     NewContainerRuntime(bm, nil, fr, st),
+		rt:     NewContainerRuntime(bm, nil, fr, st, rp),
 		runc:   fr,
+		reaper: rp,
 		bundle: bm,
 		store:  st,
 		layout: layout,
@@ -309,6 +358,95 @@ func TestRun_TerminalCopiesOutputAndRemoves(t *testing.T) {
 		t.Fatalf("output = %q, want %q", out.String(), e.runc.output)
 	}
 	e.assertNoTrace(t, res.ID)
+}
+
+// 포그라운드 run: runc create 이전에 subreaper가 되고, 컨테이너 init을 wait하여 종료 코드를 반환/기록한다
+func TestRun_ForegroundReturnsAndRecordsExitCode(t *testing.T) {
+	e := newTestEnv(t)
+	e.reaper.exitCode = 7
+
+	adoptedBeforeCreate := -1
+	e.runc.onCreate = func() { adoptedBeforeCreate = e.reaper.adoptCount() }
+
+	res, err := e.rt.Run(context.Background(), RunOptions{})
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if res.ExitCode != 7 {
+		t.Fatalf("exit code = %d, want 7", res.ExitCode)
+	}
+	if adoptedBeforeCreate != 1 {
+		t.Fatalf("Adopt must be called before runc create (adopt count at create = %d)", adoptedBeforeCreate)
+	}
+	if len(e.reaper.waited) != 1 || e.reaper.waited[0] != fakeInitPid {
+		t.Fatalf("must wait on the container init pid %d, waited=%v", fakeInitPid, e.reaper.waited)
+	}
+
+	stored, err := e.store.Get(res.ID)
+	if err != nil {
+		t.Fatalf("record missing: %v", err)
+	}
+	if stored.State != StateStopped || stored.Pid != 0 {
+		t.Fatalf("exited container must be STOPPED without pid: %+v", stored)
+	}
+	if stored.ExitCode == nil || *stored.ExitCode != 7 {
+		t.Fatalf("exit code must be recorded, got %v", stored.ExitCode)
+	}
+}
+
+func TestRun_TerminalReturnsExitCode(t *testing.T) {
+	e := newTestEnv(t)
+	e.reaper.exitCode = 130
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	res, err := e.rt.Run(ctx, RunOptions{CreateOptions: CreateOptions{Terminal: true}, Remove: true})
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if res.ExitCode != 130 {
+		t.Fatalf("exit code = %d, want 130", res.ExitCode)
+	}
+	if e.reaper.adoptCount() != 1 {
+		t.Fatalf("terminal run must adopt the container process")
+	}
+	e.assertNoTrace(t, res.ID) // --rm: 종료 코드 기록 후 삭제까지 완료
+}
+
+// detach: gocker가 먼저 종료하므로 입양도 wait도 하지 않는다 (종료 코드는 수거되지 않음)
+func TestRun_DetachDoesNotWait(t *testing.T) {
+	e := newTestEnv(t)
+	e.reaper.exitCode = 7
+
+	res, err := e.rt.Run(context.Background(), RunOptions{Detach: true})
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if res.ExitCode != 0 {
+		t.Fatalf("detached run must report 0, got %d", res.ExitCode)
+	}
+	if e.reaper.adoptCount() != 0 || len(e.reaper.waited) != 0 {
+		t.Fatalf("detached run must not adopt/wait (adopted=%d, waited=%v)", e.reaper.adoptCount(), e.reaper.waited)
+	}
+	stored, err := e.store.Get(res.ID)
+	if err != nil || stored.ExitCode != nil {
+		t.Fatalf("detached container must have no recorded exit code: %+v, %v", stored, err)
+	}
+}
+
+// 종료 코드를 얻지 못하면 0으로 뭉개지 않고 에러로 드러낸다
+func TestRun_WaitFailureIsReported(t *testing.T) {
+	e := newTestEnv(t)
+	e.reaper.waitErr = errors.New("no child processes")
+
+	res, err := e.rt.Run(context.Background(), RunOptions{})
+	if err == nil {
+		t.Fatalf("expected wait error")
+	}
+	if res.ExitCode != -1 {
+		t.Fatalf("exit code = %d, want -1 on wait failure", res.ExitCode)
+	}
 }
 
 func TestRun_TerminalStartFailureCleansUp(t *testing.T) {
