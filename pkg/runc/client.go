@@ -19,6 +19,8 @@ type RuncClient interface {
 	Delete(ctx context.Context, id string, force bool) error
 	State(ctx context.Context, id string) (*RuncState, error)
 	Run(ctx context.Context, id, bundleDir, pidFile string, ioOpts *IOOption) error
+	// NewConsole : terminal 모드 컨테이너의 PTY master를 받을 Console 생성 (경로는 IOOption.ConsoleSocket으로 전달)
+	NewConsole() (Console, error)
 }
 
 type runcClient struct {
