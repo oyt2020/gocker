@@ -6,42 +6,65 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 
-	"github.com/oyt2020/gocker/pkg/bundle"
 	"github.com/oyt2020/gocker/pkg/util"
 )
 
-// ErrNotFound 컨테이너(번들 또는 메타데이터)가 존재하지 않음
+// ErrNotFound 컨테이너 레코드가 존재하지 않음
 var ErrNotFound = errors.New("container not found")
 
-// ContainerStore 컨테이너 메타데이터 영속화 인터페이스
+const (
+	recordExt = ".json"
+	lockExt   = ".lock"
+)
+
+// ContainerStore 컨테이너 메타데이터 저장소.
+//
+// 컨테이너의 "존재"는 이 저장소의 레코드로 정의된다: 레코드가 있으면 컨테이너가 있는 것이고,
+// 번들 디렉터리나 runc 상태는 그 레코드에 딸린 리소스다.
 type ContainerStore interface {
-	// Get : 저장된 메타데이터를 읽는다 (부작용 없음)
+	// Get : 저장된 메타데이터를 읽는다 (부작용 없음). 없으면 ErrNotFound.
 	Get(id string) (*ContainerMetadata, error)
 	// Put : 메타데이터를 원자적으로 저장한다 (임시 파일 작성 후 rename)
 	Put(meta *ContainerMetadata) error
+	// Delete : 레코드를 삭제한다. 이미 없으면 nil (멱등).
+	Delete(id string) error
+	// List : 저장된 모든 메타데이터를 ID 순으로 반환한다
+	List() ([]*ContainerMetadata, error)
 	// Lock : 컨테이너 단위 배타 잠금(flock)을 획득한다. 다른 gocker 프로세스와의 동시 상태 변경을 직렬화한다.
+	// 레코드가 아직 없는 ID도 잠글 수 있다 (생성 과정 전체를 보호하기 위함).
 	Lock(id string) (unlock func(), err error)
 }
 
+// fileStore : 디렉터리 하나에 <id>.json(레코드)과 <id>.lock(잠금 파일)을 두는 구현
 type fileStore struct {
-	layout *bundle.Layout
+	dir string
 }
 
-// NewFileStore : 번들 디렉터리 안의 metadata.json을 사용하는 ContainerStore 생성
-func NewFileStore(layout *bundle.Layout) ContainerStore {
-	if layout == nil {
-		layout = bundle.NewLayout("")
-	}
-	return &fileStore{layout: layout}
+// NewFileStore : dir 아래에 메타데이터를 저장하는 ContainerStore 생성. 번들 디렉터리와는 독립적이다.
+func NewFileStore(dir string) ContainerStore {
+	return &fileStore{dir: dir}
+}
+
+func (s *fileStore) recordPath(id string) string {
+	return filepath.Join(s.dir, id+recordExt)
+}
+
+func (s *fileStore) lockPath(id string) string {
+	return filepath.Join(s.dir, id+lockExt)
 }
 
 func (s *fileStore) Get(id string) (*ContainerMetadata, error) {
 	if err := util.ValidateID(id); err != nil {
 		return nil, err
 	}
-	path := s.layout.MetadataPath(id)
+	return s.read(id)
+}
+
+func (s *fileStore) read(id string) (*ContainerMetadata, error) {
+	path := s.recordPath(id)
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -67,29 +90,87 @@ func (s *fileStore) Put(meta *ContainerMetadata) error {
 	if err != nil {
 		return fmt.Errorf("marshal container metadata: %w", err)
 	}
-	return writeFileAtomic(s.layout.MetadataPath(meta.ID), data, 0644)
+	if err := os.MkdirAll(s.dir, 0755); err != nil {
+		return fmt.Errorf("create store dir: %w", err)
+	}
+	return writeFileAtomic(s.recordPath(meta.ID), data, 0644)
+}
+
+func (s *fileStore) Delete(id string) error {
+	if err := util.ValidateID(id); err != nil {
+		return err
+	}
+	if err := os.Remove(s.recordPath(id)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("delete container metadata %q: %w", id, err)
+	}
+	return nil
+}
+
+func (s *fileStore) List() ([]*ContainerMetadata, error) {
+	entries, err := os.ReadDir(s.dir) // 이름순 정렬
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("read store dir: %w", err)
+	}
+
+	var list []*ContainerMetadata
+	for _, entry := range entries {
+		id, ok := strings.CutSuffix(entry.Name(), recordExt)
+		if !ok || entry.IsDir() || !util.IsValidID(id) {
+			continue // 잠금 파일, 원자적 쓰기의 임시 파일 등
+		}
+		meta, err := s.read(id)
+		if err != nil {
+			if errors.Is(err, ErrNotFound) {
+				continue // 목록을 읽는 사이 삭제됨
+			}
+			return nil, err
+		}
+		list = append(list, meta)
+	}
+	return list, nil
 }
 
 func (s *fileStore) Lock(id string) (func(), error) {
 	if err := util.ValidateID(id); err != nil {
 		return nil, err
 	}
-	// 잠금 파일은 번들 디렉터리 안에 있으므로 번들이 없으면(삭제됨/미존재) 잠금도 실패한다
-	f, err := os.OpenFile(s.layout.LockPath(id), os.O_CREATE|os.O_RDWR, 0600)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil, fmt.Errorf("container %q: %w", id, ErrNotFound)
+	if err := os.MkdirAll(s.dir, 0755); err != nil {
+		return nil, fmt.Errorf("create store dir: %w", err)
+	}
+	path := s.lockPath(id)
+
+	for {
+		f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0600)
+		if err != nil {
+			return nil, fmt.Errorf("open lock file: %w", err)
 		}
-		return nil, fmt.Errorf("open lock file: %w", err)
+		if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+			_ = f.Close()
+			return nil, fmt.Errorf("lock container %q: %w", id, err)
+		}
+
+		// 잠금을 기다리는 사이 이전 보유자가 잠금 파일을 지웠다면(아래 unlock 참고) 지금 잡은 것은
+		// 이미 경로에서 사라진 파일의 잠금이다. 경로가 여전히 같은 파일을 가리킬 때만 유효하다.
+		held, err1 := f.Stat()
+		current, err2 := os.Stat(path)
+		if err1 == nil && err2 == nil && os.SameFile(held, current) {
+			return func() { s.unlock(id, f) }, nil
+		}
+		_ = f.Close() // close가 flock도 해제한다 → 새 파일로 재시도
 	}
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
-		_ = f.Close()
-		return nil, fmt.Errorf("lock container %q: %w", id, err)
+}
+
+// unlock : 잠금 해제. 레코드가 없는 ID(삭제 완료 / 생성 실패 / 존재하지 않는 ID 조회)의 잠금 파일은
+// 남겨 둘 이유가 없으므로 잠금을 쥔 상태에서 지운다. 대기 중이던 쪽은 Lock의 재확인에서 새 파일로 재시도한다.
+func (s *fileStore) unlock(id string, f *os.File) {
+	if _, err := os.Stat(s.recordPath(id)); errors.Is(err, os.ErrNotExist) {
+		_ = os.Remove(s.lockPath(id))
 	}
-	return func() {
-		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
-		_ = f.Close()
-	}, nil
+	_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+	_ = f.Close()
 }
 
 // writeFileAtomic : 같은 디렉터리에 임시 파일을 쓰고 fsync 후 rename하여, 쓰는 도중 중단되어도 기존 파일이 깨지지 않게 한다
