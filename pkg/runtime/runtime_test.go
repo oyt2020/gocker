@@ -390,6 +390,72 @@ func TestDelete_HalfCreatedContainer(t *testing.T) {
 	e.assertNoTrace(t, id)
 }
 
+func TestResolve_NamePrefixAndAmbiguity(t *testing.T) {
+	e := newTestEnv(t)
+	ctx := context.Background()
+
+	for _, m := range []*ContainerMetadata{
+		{ID: "c8a19d3f10be", Name: "box-1", State: StateCreated},
+		{ID: "c8a1deadbeef", Name: "box-2", State: StateCreated},
+	} {
+		if err := e.store.Put(m); err != nil {
+			t.Fatalf("put: %v", err)
+		}
+	}
+
+	resolves := map[string]string{
+		"c8a19d3f10be": "c8a19d3f10be", // 전체 ID
+		"box-2":        "c8a1deadbeef", // 이름
+		"c8a19d":       "c8a19d3f10be", // 유일한 접두어
+	}
+	for ref, want := range resolves {
+		meta, err := e.rt.Get(ctx, ref)
+		if err != nil || meta.ID != want {
+			t.Fatalf("Get(%q) = %v, %v; want id %s", ref, meta, err, want)
+		}
+	}
+
+	// 존재하지 않는 대상 / 경로 조작 / 너무 짧은 접두어는 not found
+	for _, ref := range []string{".", "..", "../containers", "non-existent", "c8a", "000000000000"} {
+		if err := e.rt.Delete(ctx, ref, true); !errors.Is(err, store.ErrNotFound) {
+			t.Fatalf("Delete(%q): expected ErrNotFound, got %v", ref, err)
+		}
+	}
+	if err := e.rt.Delete(ctx, "", true); err == nil {
+		t.Fatalf("expected error for empty reference")
+	}
+
+	// 접두어 "c8a1"은 두 컨테이너에 일치 → 임의로 고르지 않고 에러 (not found와는 구분된다)
+	if err := e.rt.Delete(ctx, "c8a1", true); err == nil || errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("expected ambiguity error for 'c8a1', got %v", err)
+	}
+
+	// 실패한 요청들은 아무것도 지우지 않았어야 한다
+	if list, _ := e.store.List(); len(list) != 2 {
+		t.Fatalf("containers were deleted by failed references: %+v", list)
+	}
+
+	// 이름으로 삭제하면 해당 컨테이너만 지워진다
+	if err := e.rt.Delete(ctx, "box-1", false); err != nil {
+		t.Fatalf("delete by name: %v", err)
+	}
+	if list, _ := e.store.List(); len(list) != 1 || list[0].ID != "c8a1deadbeef" {
+		t.Fatalf("unexpected containers after delete: %+v", list)
+	}
+}
+
+func TestResolve_DuplicateNameIsAmbiguous(t *testing.T) {
+	e := newTestEnv(t)
+	for _, id := range []string{"aaaaaaaaaaaa", "bbbbbbbbbbbb"} {
+		if err := e.store.Put(&ContainerMetadata{ID: id, Name: "dup", State: StateCreated}); err != nil {
+			t.Fatalf("put: %v", err)
+		}
+	}
+	if err := e.rt.Start(context.Background(), "dup"); err == nil || errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("expected ambiguity error, got %v", err)
+	}
+}
+
 func TestDelete_RefusesRunningWithoutForce(t *testing.T) {
 	e := newTestEnv(t)
 	ctx := context.Background()

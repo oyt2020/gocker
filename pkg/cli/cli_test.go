@@ -144,72 +144,50 @@ func TestDispatcher_PsAndLifecycle(t *testing.T) {
 		t.Fatalf("ps -q failed: %v", err)
 	}
 
-	// gocker stop test-box (should resolve name)
+	// gocker stop test-box (이름/ID 해석은 런타임의 책임: CLI는 입력을 그대로 넘긴다)
 	if err := d.Execute(context.Background(), []string{"stop", "test-box"}); err != nil {
 		t.Fatalf("stop failed: %v", err)
 	}
-	if len(rt.stoppedIDs) != 1 || rt.stoppedIDs[0] != "c8a19d3f10be" {
-		t.Fatalf("expected stopped id c8a19d3f10be, got %v", rt.stoppedIDs)
+	if len(rt.stoppedIDs) != 1 || rt.stoppedIDs[0] != "test-box" {
+		t.Fatalf("expected stop target test-box, got %v", rt.stoppedIDs)
 	}
 
 	// gocker start test-box
 	if err := d.Execute(context.Background(), []string{"start", "test-box"}); err != nil {
 		t.Fatalf("start failed: %v", err)
 	}
-	if len(rt.startedIDs) != 1 || rt.startedIDs[0] != "c8a19d3f10be" {
-		t.Fatalf("expected started id c8a19d3f10be, got %v", rt.startedIDs)
+	if len(rt.startedIDs) != 1 || rt.startedIDs[0] != "test-box" {
+		t.Fatalf("expected start target test-box, got %v", rt.startedIDs)
 	}
 
 	// gocker rm test-box
 	if err := d.Execute(context.Background(), []string{"rm", "test-box"}); err != nil {
 		t.Fatalf("rm failed: %v", err)
 	}
-	if len(rt.deletedIDs) != 1 || rt.deletedIDs[0] != "c8a19d3f10be" {
-		t.Fatalf("expected deleted id c8a19d3f10be, got %v", rt.deletedIDs)
+	if len(rt.deletedIDs) != 1 || rt.deletedIDs[0] != "test-box" {
+		t.Fatalf("expected rm target test-box, got %v", rt.deletedIDs)
 	}
 }
 
-func TestDispatcher_ResolveContainerID_SecurityAndAmbiguity(t *testing.T) {
-	rt := &mockRuntime{
-		containers: []*runtime.ContainerMetadata{
-			{
-				ID:    "c8a19d3f10be",
-				Name:  "box-1",
-				State: runtime.StateStopped,
-			},
-			{
-				ID:    "c8a1deadbeef",
-				Name:  "box-2",
-				State: runtime.StateStopped,
-			},
-		},
-	}
+// CLI는 컨테이너 참조를 해석하지 않는다: 여러 대상을 순서대로 넘기고, 런타임 에러가 나면 거기서 멈춘다
+func TestDispatcher_PassesTargetsThroughAndStopsOnError(t *testing.T) {
+	rt := &mockRuntime{}
 	d := NewDispatcher(rt, nil)
 
-	// 1. Path traversal / non-existent targets must fail without calling Delete
-	for _, target := range []string{".", "..", "../containers", "non-existent"} {
-		if err := d.Execute(context.Background(), []string{"rm", target}); err == nil {
-			t.Fatalf("expected error for rm %q, got nil", target)
-		}
+	if err := d.Execute(context.Background(), []string{"rm", "-f", "c8a1", "box-2", "../etc"}); err != nil {
+		t.Fatalf("rm failed: %v", err)
 	}
-	if len(rt.deletedIDs) != 0 {
-		t.Fatalf("expected no deletions for invalid targets, got %v", rt.deletedIDs)
+	if got := fmt.Sprint(rt.deletedIDs); got != "[c8a1 box-2 ../etc]" {
+		t.Fatalf("targets must reach the runtime unmodified, got %s", got)
 	}
 
-	// 2. Ambiguous prefix "c8a1" matches both containers -> must return error
-	if err := d.Execute(context.Background(), []string{"rm", "c8a1"}); err == nil {
-		t.Fatalf("expected ambiguous prefix error for 'c8a1', got nil")
+	rt.deleteErr = fmt.Errorf("container not found")
+	rt.deletedIDs = nil
+	if err := d.Execute(context.Background(), []string{"rm", "a", "b"}); err == nil {
+		t.Fatalf("expected runtime error to propagate")
 	}
 	if len(rt.deletedIDs) != 0 {
-		t.Fatalf("expected no deletions on ambiguous prefix, got %v", rt.deletedIDs)
-	}
-
-	// 3. Unique prefix "c8a19d" matches only box-1 -> must succeed with canonical ID
-	if err := d.Execute(context.Background(), []string{"rm", "c8a19d"}); err != nil {
-		t.Fatalf("expected rm with unique prefix 'c8a19d' to succeed, got %v", err)
-	}
-	if len(rt.deletedIDs) != 1 || rt.deletedIDs[0] != "c8a19d3f10be" {
-		t.Fatalf("expected canonical ID 'c8a19d3f10be', got %v", rt.deletedIDs)
+		t.Fatalf("expected no successful deletions, got %v", rt.deletedIDs)
 	}
 }
 

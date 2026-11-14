@@ -45,12 +45,7 @@ func (d *Dispatcher) handleStop(ctx context.Context, args []string) error {
 	timeout := time.Duration(*timeoutSec) * time.Second
 
 	for _, target := range targets {
-		id, err := d.resolveContainerID(ctx, target)
-		if err != nil {
-			return err
-		}
-
-		if err := d.rt.Stop(ctx, id, timeout); err != nil {
+		if err := d.rt.Stop(ctx, target, timeout); err != nil {
 			return fmt.Errorf("컨테이너 %q 중지 실패: %w", target, err)
 		}
 		fmt.Println(target)

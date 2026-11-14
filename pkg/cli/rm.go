@@ -36,12 +36,7 @@ func (d *Dispatcher) handleRm(ctx context.Context, args []string) error {
 	}
 
 	for _, target := range targets {
-		id, err := d.resolveContainerID(ctx, target)
-		if err != nil {
-			return err
-		}
-
-		if err := d.rt.Delete(ctx, id, *force); err != nil {
+		if err := d.rt.Delete(ctx, target, *force); err != nil {
 			return fmt.Errorf("컨테이너 %q 삭제 실패: %w", target, err)
 		}
 		fmt.Println(target)

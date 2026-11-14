@@ -48,14 +48,15 @@ type RunResult struct {
 
 // ContainerRuntime 컨테이너 라이프사이클 관리 인터페이스 (CLI에 대한 API 경계)
 // 터미널 제어(raw 모드 등)는 호출자(CLI)의 책임이며, 런타임은 주입받은 스트림만 사용한다.
+// ref는 컨테이너 참조(전체 ID / ID 접두어 / 이름)이며, 전체 ID로의 해석은 런타임이 한다 (resolve.go).
 type ContainerRuntime interface {
 	Create(ctx context.Context, opts CreateOptions) (*ContainerMetadata, error)
-	Start(ctx context.Context, id string) error
+	Start(ctx context.Context, ref string) error
 	Run(ctx context.Context, opts RunOptions) (RunResult, error)
-	Stop(ctx context.Context, id string, timeout time.Duration) error
-	Delete(ctx context.Context, id string, force bool) error
+	Stop(ctx context.Context, ref string, timeout time.Duration) error
+	Delete(ctx context.Context, ref string, force bool) error
 	List(ctx context.Context, all bool) ([]*ContainerMetadata, error)
-	Get(ctx context.Context, id string) (*ContainerMetadata, error)
+	Get(ctx context.Context, ref string) (*ContainerMetadata, error)
 }
 
 type runcRuntime struct {
@@ -250,15 +251,15 @@ func (r *runcRuntime) create(ctx context.Context, opts CreateOptions) (*Containe
 	return meta, master, nil
 }
 
-// Start : `runc start` 명령어 실행
-func (r *runcRuntime) Start(ctx context.Context, id string) error {
+// start : `runc start` 명령어 실행
+func (r *runcRuntime) start(ctx context.Context, id string) error {
 	unlock, err := r.store.Lock(id)
 	if err != nil {
 		return err
 	}
 	defer unlock()
 
-	meta, err := r.Get(ctx, id)
+	meta, err := r.get(ctx, id)
 	if err != nil {
 		return fmt.Errorf("get metadata: %w", err)
 	}
@@ -301,7 +302,7 @@ func (r *runcRuntime) Run(ctx context.Context, opts RunOptions) (RunResult, erro
 
 	if opts.Remove {
 		defer func() {
-			_ = r.Delete(context.Background(), id, true)
+			_ = r.remove(context.Background(), id, true)
 		}()
 	}
 
@@ -311,8 +312,8 @@ func (r *runcRuntime) Run(ctx context.Context, opts RunOptions) (RunResult, erro
 			return result, fmt.Errorf("create container: %w", err)
 		}
 
-		if err := r.Start(ctx, id); err != nil {
-			_ = r.Delete(context.Background(), id, true)
+		if err := r.start(ctx, id); err != nil {
+			_ = r.remove(context.Background(), id, true)
 			return result, fmt.Errorf("start container: %w", err)
 		}
 
@@ -347,7 +348,7 @@ func (r *runcRuntime) runWithTerminal(ctx context.Context, opts RunOptions) (int
 	started := false
 	defer func() {
 		if !started {
-			_ = r.Delete(context.Background(), id, true)
+			_ = r.remove(context.Background(), id, true)
 		}
 	}()
 	defer ptyMaster.Close() // 마지막 정리 지점: 실제 close 시 slave 쪽 hangup
@@ -385,7 +386,7 @@ func (r *runcRuntime) runWithTerminal(ctx context.Context, opts RunOptions) (int
 	defer stopOutput(0)
 
 	// `runc start` 실행
-	if err := r.Start(ctx, id); err != nil {
+	if err := r.start(ctx, id); err != nil {
 		return -1, fmt.Errorf("start container: %w", err)
 	}
 	started = true
@@ -418,15 +419,15 @@ func (r *runcRuntime) waitForExit(ctx context.Context, id string) (int, error) {
 	}
 }
 
-// Stop : `runc stop` 최초 신호는 SIGTERM 시간 초과하면 SIGKILL 신호 전송
-func (r *runcRuntime) Stop(ctx context.Context, id string, timeout time.Duration) error {
+// stop : `runc stop` 최초 신호는 SIGTERM 시간 초과하면 SIGKILL 신호 전송
+func (r *runcRuntime) stop(ctx context.Context, id string, timeout time.Duration) error {
 	unlock, err := r.store.Lock(id)
 	if err != nil {
 		return err
 	}
 	defer unlock()
 
-	meta, err := r.Get(ctx, id)
+	meta, err := r.get(ctx, id)
 	if err != nil {
 		return fmt.Errorf("get metadata: %w", err)
 	}
@@ -463,17 +464,17 @@ func (r *runcRuntime) Stop(ctx context.Context, id string, timeout time.Duration
 	return markStopped()
 }
 
-// Delete : 컨테이너에 딸린 리소스를 "runc → 번들 → 레코드" 순서로 제거한다.
+// remove : 컨테이너에 딸린 리소스를 "runc → 번들 → 레코드" 순서로 제거한다.
 // 레코드를 마지막에 지우므로 도중에 실패하거나 중단되어도 컨테이너가 목록에 남아 다시 rm할 수 있다.
 // 그래서 이미 없는 runc 컨테이너 / 번들은 에러가 아니다 (생성 도중 중단된 컨테이너도 같은 경로로 정리된다).
-func (r *runcRuntime) Delete(ctx context.Context, id string, force bool) error {
+func (r *runcRuntime) remove(ctx context.Context, id string, force bool) error {
 	unlock, err := r.store.Lock(id)
 	if err != nil {
 		return fmt.Errorf("get container %q: %w", id, err)
 	}
 	defer unlock() // 레코드가 지워졌으면 잠금 파일도 함께 정리된다
 
-	meta, err := r.Get(ctx, id)
+	meta, err := r.get(ctx, id)
 	if err != nil {
 		return fmt.Errorf("get container %q: %w", id, err)
 	}
@@ -494,9 +495,9 @@ func (r *runcRuntime) Delete(ctx context.Context, id string, force bool) error {
 	return r.store.Delete(id)
 }
 
-// Get : 저장된 메타데이터에 runc에서 관측한 실제 상태를 반영하여 반환한다.
+// get : 저장된 메타데이터에 runc에서 관측한 실제 상태를 반영하여 반환한다.
 // 읽기 전용이다: 관측 결과는 반환값에만 반영되고 저장하지 않는다 (저장은 상태를 바꾸는 명령의 책임).
-func (r *runcRuntime) Get(ctx context.Context, id string) (*ContainerMetadata, error) {
+func (r *runcRuntime) get(ctx context.Context, id string) (*ContainerMetadata, error) {
 	meta, err := r.store.Get(id)
 	if err != nil {
 		return nil, err
