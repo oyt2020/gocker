@@ -751,6 +751,67 @@ func TestStop_MissingRuncContainerIsStopped(t *testing.T) {
 	e.assertStored(t, id, StateStopped)
 }
 
+// 재부팅 등으로 runc 상태가 사라진 "유령 RUNNING": 조회에서는 STOPPED로 보이고 -f 없이 삭제된다.
+// 조회는 읽기 전용이므로 저장된 레코드는 바꾸지 않는다.
+func TestObserve_RunningWithoutRuncContainerIsShownStopped(t *testing.T) {
+	e := newTestEnv(t)
+	ctx := context.Background()
+	id := e.startRunning(t)
+
+	e.runc.mu.Lock()
+	delete(e.runc.status, id) // runc가 더 이상 이 컨테이너를 모른다
+	e.runc.mu.Unlock()
+
+	meta, err := e.rt.Get(ctx, id)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if meta.State != StateStopped || meta.Pid != 0 {
+		t.Fatalf("observed = %s (pid %d), want STOPPED without pid", meta.State, meta.Pid)
+	}
+	if running, _ := e.rt.List(ctx, false); len(running) != 0 {
+		t.Fatalf("ghost container must not be listed as running: %+v", running)
+	}
+	e.assertStored(t, id, StateRunning)
+
+	if err := e.rt.Delete(ctx, id, false); err != nil {
+		t.Fatalf("ghost container must be removable without force: %v", err)
+	}
+	e.assertNoTrace(t, id)
+}
+
+// CREATED는 runc 컨테이너가 없어도 그대로 둔다 (생성 중에는 레코드가 먼저 만들어지므로 정상적인 상태)
+func TestObserve_CreatedWithoutRuncContainerStaysCreated(t *testing.T) {
+	e := newTestEnv(t)
+	const id = "abcdef012345"
+
+	if err := e.store.Put(&ContainerMetadata{ID: id, State: StateCreated}); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	meta, err := e.rt.Get(context.Background(), id)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if meta.State != StateCreated {
+		t.Fatalf("observed = %s, want CREATED", meta.State)
+	}
+}
+
+// runc 조회가 "없음"이 아닌 이유로 실패하면 상태를 알 수 없으므로 저장된 상태를 그대로 보여준다
+func TestObserve_StateFailureKeepsStoredState(t *testing.T) {
+	e := newTestEnv(t)
+	id := e.startRunning(t)
+	e.runc.stateErr = errors.New("runc state failed: permission denied")
+
+	meta, err := e.rt.Get(context.Background(), id)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if meta.State != StateRunning {
+		t.Fatalf("observed = %s, want the stored RUNNING", meta.State)
+	}
+}
+
 func TestMissingContainerLeavesNoLockFile(t *testing.T) {
 	e := newTestEnv(t)
 	ctx := context.Background()

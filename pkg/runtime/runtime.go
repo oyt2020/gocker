@@ -596,9 +596,17 @@ func (r *runcRuntime) get(ctx context.Context, id string) (*ContainerMetadata, e
 }
 
 // observe : runc 상태를 조회해 메타데이터에 반영한다 (조회 실패 또는 created/creating 등은 저장된 상태 유지)
+//
+// 예외: 저장된 상태는 RUNNING인데 runc가 그 컨테이너를 아예 모르면(runc.ErrNotFound) STOPPED로 본다.
+// 재부팅으로 runc 상태 디렉터리(/run/runc, tmpfs)가 비워지면 프로세스는 이미 없는데 레코드만 RUNNING으로 남는다.
+// 이것을 그대로 믿으면 죽은 컨테이너가 계속 실행 중으로 보이고 rm이 -f를 요구하게 된다.
+// CREATED에는 적용하지 않는다: 생성 중에는 레코드가 runc 컨테이너보다 먼저 만들어지므로 "runc가 모름"이 정상이다.
 func (r *runcRuntime) observe(ctx context.Context, meta *ContainerMetadata) {
 	state, err := r.runcClient.State(ctx, meta.ID)
 	if err != nil {
+		if errors.Is(err, runc.ErrNotFound) && meta.State == StateRunning {
+			meta.ApplyObserved(StateStopped, 0)
+		}
 		return
 	}
 	switch state.Status {
