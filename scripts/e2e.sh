@@ -127,6 +127,32 @@ fi
 expect_contains "취소된 stop 후에도 running" "$IID" $GOCKER ps -q
 run_case "취소된 stop 후 rm -f" $GOCKER rm -f "$IID"
 
+# --- 8. run -d --rm 은 거부된다 (시작 직후 삭제되는 컨테이너를 만들지 않는다) ---
+expect_exit "run -d --rm 거부" 1 $GOCKER run -d --rm alpine sleep 300
+n=$((n + 1))
+if [ -z "$($GOCKER ps -a -q)" ]; then
+  echo "PASS  거부된 run은 컨테이너를 남기지 않음"
+else
+  echo "FAIL  거부된 run이 컨테이너를 남김"
+  FAILED+=("거부된 run이 컨테이너를 남김")
+fi
+
+# --- 9. 이름은 유일해야 한다: 중복 생성 거부, 삭제 후 재사용 ---
+run_case "create --name" $GOCKER create --name e2e-dup alpine sleep 300
+expect_exit "같은 이름으로 create 거부" 1 $GOCKER create --name e2e-dup alpine sleep 300
+expect_exit "같은 이름으로 run 거부" 1 $GOCKER run -d --name e2e-dup alpine sleep 300
+n=$((n + 1))
+DUP_COUNT=$($GOCKER ps -a -q | wc -l)
+if [ "$DUP_COUNT" -eq 1 ]; then
+  echo "PASS  거부된 생성은 컨테이너를 남기지 않음"
+else
+  echo "FAIL  이름 중복 거부 후 컨테이너 수=$DUP_COUNT (기대=1)"
+  FAILED+=("이름 중복 거부 후 컨테이너 수=$DUP_COUNT")
+fi
+run_case "이름으로 rm" $GOCKER rm e2e-dup
+run_case "삭제 후 같은 이름 재사용" $GOCKER create --name e2e-dup alpine sleep 300
+run_case "재사용한 컨테이너 rm" $GOCKER rm e2e-dup
+
 # --- 결과 ---
 echo
 if [ ${#FAILED[@]} -eq 0 ]; then
