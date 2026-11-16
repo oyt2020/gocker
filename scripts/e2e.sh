@@ -101,6 +101,32 @@ else
 fi
 run_case "포그라운드 컨테이너 rm" $GOCKER rm e2e-sig
 
+# --- 6. 이미 스스로 종료한 컨테이너 stop (신호 없이 성공해야 한다) → rm ---
+run_case "run -d (즉시 종료)" $GOCKER run -d alpine true
+XID=$LAST_OUT
+sleep 1
+run_case "종료된 컨테이너 stop" $GOCKER stop -t 2 "$XID"
+run_case "종료된 컨테이너 rm" $GOCKER rm "$XID"
+
+# --- 7. stop 도중 Ctrl+C(SIGINT): 곧바로 실패로 반환하고, 살아 있는 컨테이너를 STOPPED로 기록하지 않는다 ---
+run_case "run -d (SIGTERM 무시)" $GOCKER run -d alpine sleep 300
+IID=$LAST_OUT
+# sleep은 PID 1이라 SIGTERM을 무시하므로 stop은 30초 대기에 들어간다. 1초 뒤 SIGINT를 보내 중단시킨다.
+INT_T0=$SECONDS
+timeout -s INT 1 $GOCKER stop -t 30 "$IID" >"$TMP/int.log" 2>&1
+INT_RC=$?
+INT_ELAPSED=$((SECONDS - INT_T0))
+n=$((n + 1))
+if [ $INT_RC -ne 0 ] && [ $INT_ELAPSED -lt 10 ]; then
+  echo "PASS  stop 도중 SIGINT → 곧바로 실패로 반환 (${INT_ELAPSED}s)"
+else
+  echo "FAIL  stop 도중 SIGINT (exit=$INT_RC, ${INT_ELAPSED}s)"
+  echo "::group::stop 출력"; cat "$TMP/int.log"; echo "::endgroup::"
+  FAILED+=("stop 도중 SIGINT  ->  exit=$INT_RC, ${INT_ELAPSED}s")
+fi
+expect_contains "취소된 stop 후에도 running" "$IID" $GOCKER ps -q
+run_case "취소된 stop 후 rm -f" $GOCKER rm -f "$IID"
+
 # --- 결과 ---
 echo
 if [ ${#FAILED[@]} -eq 0 ]; then
