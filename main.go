@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/signal"
+	"syscall"
 
 	"github.com/oyt2020/gocker/pkg/cli"
 	ctd "github.com/oyt2020/gocker/pkg/containerd"
@@ -14,7 +16,10 @@ import (
 const defaultContainerdSocket = "/run/containerd/containerd.sock"
 
 func main() {
-	ctx := context.Background()
+	// Ctrl+C(SIGINT) / SIGTERM을 받으면 ctx를 취소하여 진행 중인 명령이 정리하고 반환할 기회를 준다.
+	// 취소 후에는 시그널 처리를 기본 동작으로 되돌리므로, 한 번 더 누르면 즉시 종료된다.
+	ctx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	context.AfterFunc(ctx, stopSignals)
 
 	// 1. Phase 2 OCI / runc 기반 독립 런타임 초기화
 	rt := runtime.NewContainerRuntime(nil, nil, nil, nil, nil)
