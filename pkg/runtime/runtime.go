@@ -157,8 +157,11 @@ func (r *runcRuntime) Create(ctx context.Context, opts CreateOptions) (*Containe
 // 죽어도 컨테이너가 목록에 보이고 rm으로 정리할 수 있다 (Delete는 없는 번들/runc 컨테이너를 허용한다).
 // 전체 과정은 컨테이너 잠금으로 보호되므로, 만들어지는 중인 컨테이너에 대한 start/stop/rm은 완료까지 대기한다.
 //
+// 롤백 자체가 실패하면 그 에러도 함께 반환한다. 이때 롤백은 실패한 지점에서 멈추므로 레코드가 남고,
+// 남은 리소스는 rm으로 다시 정리할 수 있다.
+//
 // terminal 모드에서는 PTY master를 함께 반환하며 소유권(닫을 책임)은 호출자에게 있다.
-func (r *runcRuntime) create(ctx context.Context, opts CreateOptions) (*ContainerMetadata, *os.File, error) {
+func (r *runcRuntime) create(ctx context.Context, opts CreateOptions) (meta *ContainerMetadata, master *os.File, err error) {
 	id := opts.ID
 
 	unlock, err := r.store.Lock(id)
@@ -175,11 +178,14 @@ func (r *runcRuntime) create(ctx context.Context, opts CreateOptions) (*Containe
 
 	rollback := NewRollbackTracker()
 	defer func() {
-		_ = rollback.Rollback()
+		// 성공 경로에서는 Commit으로 비워져 있어 아무것도 실행되지 않는다
+		if rbErr := rollback.Rollback(); rbErr != nil {
+			err = errors.Join(err, fmt.Errorf("container %s is left behind, remove it with 'gocker rm': %w", id, rbErr))
+		}
 	}()
 
 	// 1. 메타데이터 레코드 저장 (컨테이너의 존재를 선언)
-	meta := newMetadata(id, opts, r.bundleMgr.Layout().BundleDir(id))
+	meta = newMetadata(id, opts, r.bundleMgr.Layout().BundleDir(id))
 	if err := r.store.Put(meta); err != nil {
 		return nil, nil, fmt.Errorf("save container metadata: %w", err)
 	}
@@ -252,7 +258,6 @@ func (r *runcRuntime) create(ctx context.Context, opts CreateOptions) (*Containe
 	})
 
 	// 6. terminal 모드: runc가 보낸 PTY master 수신
-	var master *os.File
 	if console != nil {
 		master, err = console.WaitMaster(ctx)
 		if err != nil {
@@ -318,14 +323,16 @@ func (r *runcRuntime) initPid(id string) (int, error) {
 // 포그라운드(detach가 아님)에서는 컨테이너가 끝날 때까지 기다려 종료 코드를 반환한다. 이를 위해 gocker가
 // child subreaper가 되어 컨테이너 init 프로세스를 입양하고 직접 wait한다 (pkg/reaper 참고).
 // detach에서는 gocker가 컨테이너보다 먼저 종료하므로 종료 코드를 수거할 프로세스가 없다 (데몬/shim이 없는 구조의 한계).
-func (r *runcRuntime) Run(ctx context.Context, opts RunOptions) (RunResult, error) {
+//
+// 정리(--rm, 시작 실패 후 삭제)가 실패하면 그 에러도 함께 반환한다.
+func (r *runcRuntime) Run(ctx context.Context, opts RunOptions) (result RunResult, err error) {
 	id, err := ensureID(opts.ID)
 	if err != nil {
 		return RunResult{ExitCode: -1}, err
 	}
 	opts.ID = id
 	// ID는 생성 단계 이전에 할당되므로 실패 시에도 채워질 수 있다 (해당 컨테이너는 롤백으로 정리됨)
-	result := RunResult{ID: id, ExitCode: -1}
+	result = RunResult{ID: id, ExitCode: -1}
 
 	if !opts.Detach {
 		// 입양은 부모(runc create)가 죽는 시점에 결정되므로 반드시 runc create 이전에 subreaper가 되어야 한다
@@ -336,7 +343,9 @@ func (r *runcRuntime) Run(ctx context.Context, opts RunOptions) (RunResult, erro
 
 	if opts.Remove {
 		defer func() {
-			_ = r.remove(context.Background(), id, true)
+			if cErr := r.cleanup(id); cErr != nil {
+				err = errors.Join(err, cErr)
+			}
 		}()
 	}
 
@@ -347,8 +356,11 @@ func (r *runcRuntime) Run(ctx context.Context, opts RunOptions) (RunResult, erro
 		}
 
 		if err := r.start(ctx, id); err != nil {
-			_ = r.remove(context.Background(), id, true)
-			return result, fmt.Errorf("start container: %w", err)
+			err = fmt.Errorf("start container: %w", err)
+			if cErr := r.cleanup(id); cErr != nil {
+				err = errors.Join(err, cErr)
+			}
+			return result, err
 		}
 
 		if opts.Detach {
@@ -367,7 +379,7 @@ func (r *runcRuntime) Run(ctx context.Context, opts RunOptions) (RunResult, erro
 
 // runWithTerminal : PTY master를 유지한 채 컨테이너를 실행하고 주입받은 스트림과 연결한다.
 // 터미널 raw 모드 전환/복구는 호출자의 책임이며, 이 함수는 반환 전에 출력 복사 고루틴의 종료를 보장한다.
-func (r *runcRuntime) runWithTerminal(ctx context.Context, opts RunOptions) (int, error) {
+func (r *runcRuntime) runWithTerminal(ctx context.Context, opts RunOptions) (exitCode int, err error) {
 	id := opts.ID
 
 	createOpts := opts.CreateOptions
@@ -382,7 +394,9 @@ func (r *runcRuntime) runWithTerminal(ctx context.Context, opts RunOptions) (int
 	started := false
 	defer func() {
 		if !started {
-			_ = r.remove(context.Background(), id, true)
+			if cErr := r.cleanup(id); cErr != nil {
+				err = errors.Join(err, cErr)
+			}
 		}
 	}()
 	defer ptyMaster.Close() // 마지막 정리 지점: 실제 close 시 slave 쪽 hangup
@@ -482,9 +496,22 @@ func (r *runcRuntime) recordExit(id string, exitCode int) error {
 	return r.store.Put(meta)
 }
 
+// cleanup : 실패 경로 / --rm 에서 컨테이너를 강제 삭제한다. 이미 없으면(롤백 등으로 정리됨) 할 일이 없다.
+// 호출자의 ctx가 취소된 뒤에도 정리는 끝까지 해야 하므로 별도의 컨텍스트를 쓴다.
+func (r *runcRuntime) cleanup(id string) error {
+	err := r.remove(context.Background(), id, true)
+	if err == nil || errors.Is(err, store.ErrNotFound) {
+		return nil
+	}
+	return fmt.Errorf("clean up container %s: %w", id, err)
+}
+
 // remove : 컨테이너에 딸린 리소스를 "runc → 번들 → 레코드" 순서로 제거한다.
 // 레코드를 마지막에 지우므로 도중에 실패하거나 중단되어도 컨테이너가 목록에 남아 다시 rm할 수 있다.
 // 그래서 이미 없는 runc 컨테이너 / 번들은 에러가 아니다 (생성 도중 중단된 컨테이너도 같은 경로로 정리된다).
+//
+// 반대로 어느 단계든 "없어서"가 아닌 이유로 실패하면 거기서 멈추고 에러를 반환한다. 치우지 못한 리소스를 두고
+// 다음 단계로 넘어가면, 살아 있는 runc 컨테이너를 가리키던 번들과 레코드가 사라져 다시 정리할 수 없게 된다.
 func (r *runcRuntime) remove(ctx context.Context, id string, force bool) error {
 	unlock, err := r.store.Lock(id)
 	if err != nil {
@@ -501,12 +528,14 @@ func (r *runcRuntime) remove(ctx context.Context, id string, force bool) error {
 		return fmt.Errorf("container %q is running, use -f to force remove", id)
 	}
 
-	// runc 리소스 제거
-	_ = r.runcClient.Delete(ctx, id, force)
+	// runc 리소스 제거 (이미 없는 것만 정상으로 본다)
+	if err := r.runcClient.Delete(ctx, id, force); err != nil && !errors.Is(err, runc.ErrNotFound) {
+		return fmt.Errorf("delete runc container: %w", err)
+	}
 
 	// 번들 디렉터리 제거
 	if err := r.bundleMgr.Delete(id); err != nil {
-		return err
+		return fmt.Errorf("delete bundle: %w", err)
 	}
 
 	// 메타데이터 레코드 제거 (이 시점부터 컨테이너는 존재하지 않는다)

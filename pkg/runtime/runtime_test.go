@@ -69,6 +69,13 @@ type fakeRunc struct {
 	signals       []string        // Kill로 전달된 신호 (순서대로)
 	killErr       error
 	stateErr      error
+	deleteErr     error
+}
+
+func (f *fakeRunc) setDeleteErr(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.deleteErr = err
 }
 
 func (f *fakeRunc) sentSignals() []string {
@@ -193,6 +200,9 @@ func (f *fakeRunc) Kill(ctx context.Context, id, signal string) error {
 func (f *fakeRunc) Delete(ctx context.Context, id string, force bool) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.deleteErr != nil {
+		return f.deleteErr
+	}
 	if _, ok := f.status[id]; !ok {
 		return fmt.Errorf("container %q: %w", id, runc.ErrNotFound)
 	}
@@ -754,6 +764,81 @@ func TestDelete_HalfCreatedContainer(t *testing.T) {
 		t.Fatalf("delete: %v", err)
 	}
 	e.assertNoTrace(t, id)
+}
+
+// runc delete가 "없어서"가 아닌 이유로 실패하면 번들과 레코드를 남겨 다시 rm할 수 있어야 한다
+func TestDelete_RuncDeleteFailureKeepsContainer(t *testing.T) {
+	e := newTestEnv(t)
+	ctx := context.Background()
+	boom := errors.New("runc delete failed: device or resource busy")
+
+	meta, err := e.rt.Create(ctx, CreateOptions{})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	e.runc.setDeleteErr(boom)
+	if err := e.rt.Delete(ctx, meta.ID, true); !errors.Is(err, boom) {
+		t.Fatalf("delete error = %v, want it to wrap the runc delete failure", err)
+	}
+	if _, err := e.store.Get(meta.ID); err != nil {
+		t.Fatalf("record must survive a failed delete: %v", err)
+	}
+	if !e.bundle.Exists(meta.ID) {
+		t.Fatalf("bundle must survive a failed delete")
+	}
+
+	// 원인이 해소되면 같은 명령으로 끝까지 정리된다
+	e.runc.setDeleteErr(nil)
+	if err := e.rt.Delete(ctx, meta.ID, true); err != nil {
+		t.Fatalf("retry delete: %v", err)
+	}
+	e.assertNoTrace(t, meta.ID)
+}
+
+// 생성 실패 후 롤백까지 실패하면: 두 에러를 모두 보고하고, 남은 리소스를 rm으로 치울 수 있도록 레코드를 남긴다
+func TestCreate_RollbackFailureIsReportedAndKeepsRecord(t *testing.T) {
+	e := newTestEnv(t)
+	ctx := context.Background()
+	const id = "abcdef012345"
+
+	createFailure := errors.New("timeout waiting for pty master")
+	rollbackFailure := errors.New("runc delete failed: device or resource busy")
+	e.runc.waitErr = createFailure // runc create는 성공하고 그 뒤 단계가 실패한다
+	e.runc.setDeleteErr(rollbackFailure)
+
+	_, err := e.rt.Create(ctx, CreateOptions{ID: id, Terminal: true})
+	if !errors.Is(err, createFailure) || !errors.Is(err, rollbackFailure) {
+		t.Fatalf("create error = %v, want both the create failure and the rollback failure", err)
+	}
+	if _, err := e.store.Get(id); err != nil {
+		t.Fatalf("record must be kept when rollback fails: %v", err)
+	}
+
+	e.runc.setDeleteErr(nil)
+	if err := e.rt.Delete(ctx, id, true); err != nil {
+		t.Fatalf("delete leftover container: %v", err)
+	}
+	e.assertNoTrace(t, id)
+}
+
+// --rm 정리가 실패하면 조용히 넘어가지 않고 에러로 드러낸다 (종료 코드는 그대로 전달)
+func TestRun_RemoveFailureIsReported(t *testing.T) {
+	e := newTestEnv(t)
+	e.reaper.exitCode = 3
+	boom := errors.New("runc delete failed: device or resource busy")
+	e.runc.setDeleteErr(boom)
+
+	res, err := e.rt.Run(context.Background(), RunOptions{Remove: true})
+	if !errors.Is(err, boom) {
+		t.Fatalf("run error = %v, want it to wrap the cleanup failure", err)
+	}
+	if res.ExitCode != 3 {
+		t.Fatalf("exit code = %d, want 3", res.ExitCode)
+	}
+	if _, err := e.store.Get(res.ID); err != nil {
+		t.Fatalf("record must be kept when --rm cleanup fails: %v", err)
+	}
 }
 
 func TestResolve_NamePrefixAndAmbiguity(t *testing.T) {
