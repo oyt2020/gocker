@@ -18,6 +18,8 @@ var ErrNotFound = errors.New("container not found")
 const (
 	recordExt = ".json"
 	lockExt   = ".lock"
+	// namesLockFile 저장소 전역 잠금 파일 이름. 컨테이너 ID 형식이 아니므로 레코드/컨테이너 잠금 파일과 겹치지 않는다.
+	namesLockFile = "names" + lockExt
 )
 
 // ContainerStore 컨테이너 메타데이터 저장소.
@@ -36,6 +38,10 @@ type ContainerStore interface {
 	// Lock : 컨테이너 단위 배타 잠금(flock)을 획득한다. 다른 gocker 프로세스와의 동시 상태 변경을 직렬화한다.
 	// 레코드가 아직 없는 ID도 잠글 수 있다 (생성 과정 전체를 보호하기 위함).
 	Lock(id string) (unlock func(), err error)
+	// LockNames : 저장소 전역 배타 잠금(flock)을 획득한다. 컨테이너 이름처럼 여러 레코드에 걸친 유일성 제약을
+	// "검사 → 기록"할 때, 그 사이에 다른 gocker 프로세스가 끼어들지 못하도록 묶는 용도다.
+	// 컨테이너 잠금과 함께 쓸 때는 항상 컨테이너 잠금을 먼저 잡는다 (교착 방지).
+	LockNames() (unlock func(), err error)
 }
 
 // fileStore : 디렉터리 하나에 <id>.json(레코드)과 <id>.lock(잠금 파일)을 두는 구현
@@ -137,10 +143,32 @@ func (s *fileStore) Lock(id string) (func(), error) {
 	if err := util.ValidateID(id); err != nil {
 		return nil, err
 	}
+	f, err := s.acquire(s.lockPath(id))
+	if err != nil {
+		return nil, fmt.Errorf("lock container %q: %w", id, err)
+	}
+	return func() { s.unlock(id, f) }, nil
+}
+
+func (s *fileStore) LockNames() (func(), error) {
+	path := filepath.Join(s.dir, namesLockFile)
+	f, err := s.acquire(path)
+	if err != nil {
+		return nil, fmt.Errorf("lock container names: %w", err)
+	}
+	return func() {
+		// 잠금 파일을 남기지 않는다. 잠금을 쥔 상태에서 지우므로, 대기 중이던 쪽은 acquire의 재확인에서 새 파일로 재시도한다.
+		_ = os.Remove(path)
+		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		_ = f.Close()
+	}, nil
+}
+
+// acquire : path의 잠금 파일에 배타 flock을 잡고 그 파일을 반환한다 (해제는 호출자 책임).
+func (s *fileStore) acquire(path string) (*os.File, error) {
 	if err := os.MkdirAll(s.dir, 0755); err != nil {
 		return nil, fmt.Errorf("create store dir: %w", err)
 	}
-	path := s.lockPath(id)
 
 	for {
 		f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0600)
@@ -149,15 +177,15 @@ func (s *fileStore) Lock(id string) (func(), error) {
 		}
 		if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
 			_ = f.Close()
-			return nil, fmt.Errorf("lock container %q: %w", id, err)
+			return nil, fmt.Errorf("flock: %w", err)
 		}
 
-		// 잠금을 기다리는 사이 이전 보유자가 잠금 파일을 지웠다면(아래 unlock 참고) 지금 잡은 것은
+		// 잠금을 기다리는 사이 이전 보유자가 잠금 파일을 지웠다면(unlock / LockNames 참고) 지금 잡은 것은
 		// 이미 경로에서 사라진 파일의 잠금이다. 경로가 여전히 같은 파일을 가리킬 때만 유효하다.
 		held, err1 := f.Stat()
 		current, err2 := os.Stat(path)
 		if err1 == nil && err2 == nil && os.SameFile(held, current) {
-			return func() { s.unlock(id, f) }, nil
+			return f, nil
 		}
 		_ = f.Close() // close가 flock도 해제한다 → 새 파일로 재시도
 	}

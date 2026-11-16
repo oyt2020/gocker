@@ -18,10 +18,13 @@ import (
 	"github.com/oyt2020/gocker/pkg/util"
 )
 
+// ErrNameInUse 같은 이름을 가진 컨테이너가 이미 존재한다 (이름은 컨테이너 사이에서 유일해야 한다)
+var ErrNameInUse = errors.New("container name already in use")
+
 // CreateOptions Create 옵션
 type CreateOptions struct {
 	ID            string // 비어 있으면 런타임이 생성한다
-	Name          string
+	Name          string // 비어 있지 않으면 다른 컨테이너와 겹칠 수 없다 (ErrNameInUse)
 	RootfsTarPath string
 	Command       []string
 	Env           []string
@@ -188,10 +191,10 @@ func (r *runcRuntime) create(ctx context.Context, opts CreateOptions) (meta *Con
 		}
 	}()
 
-	// 1. 메타데이터 레코드 저장 (컨테이너의 존재를 선언)
+	// 1. 메타데이터 레코드 저장 (컨테이너의 존재와 이름을 선언)
 	meta = newMetadata(id, opts, r.bundleMgr.Layout().BundleDir(id))
-	if err := r.store.Put(meta); err != nil {
-		return nil, nil, fmt.Errorf("save container metadata: %w", err)
+	if err := r.reserve(meta); err != nil {
+		return nil, nil, err
 	}
 	rollback.Add(func() error {
 		return r.store.Delete(id)
@@ -272,6 +275,37 @@ func (r *runcRuntime) create(ctx context.Context, opts CreateOptions) (meta *Con
 	// Success: 롤백 함수 제거
 	rollback.Commit()
 	return meta, master, nil
+}
+
+// reserve : 새 컨테이너의 레코드를 기록한다.
+//
+// 이름이 있으면 다른 컨테이너가 이미 쓰고 있는지 확인하고, 쓰고 있으면 ErrNameInUse를 반환한다.
+// "중복 검사 → 기록"은 저장소 전역 잠금으로 묶여 있어, 동시에 실행된 다른 gocker 프로세스가 같은 이름을 차지할 수 없다.
+// 잠금은 기록 직후 풀리므로 이후의 느린 단계(rootfs 압축 해제, runc create)가 다른 컨테이너의 생성을 막지 않는다.
+// 이름은 레코드와 함께 사라지므로, 컨테이너를 삭제하면 그 이름을 다시 쓸 수 있다.
+func (r *runcRuntime) reserve(meta *ContainerMetadata) error {
+	if meta.Name != "" {
+		unlock, err := r.store.LockNames()
+		if err != nil {
+			return err
+		}
+		defer unlock()
+
+		existing, err := r.store.List()
+		if err != nil {
+			return fmt.Errorf("list containers: %w", err)
+		}
+		for _, other := range existing {
+			if other.Name == meta.Name {
+				return fmt.Errorf("container name %q is already in use by container %s: %w", meta.Name, other.ID, ErrNameInUse)
+			}
+		}
+	}
+
+	if err := r.store.Put(meta); err != nil {
+		return fmt.Errorf("save container metadata: %w", err)
+	}
+	return nil
 }
 
 // start : `runc start` 명령어 실행

@@ -174,6 +174,52 @@ func TestFileStore_Lock(t *testing.T) {
 }
 
 // 레코드가 없는 ID도 잠글 수 있고(생성 보호), 해제 시 잠금 파일이 남지 않아야 한다
+// 저장소 전역 잠금: 한 번에 하나만 잡을 수 있고, 풀고 나면 잠금 파일이 남지 않는다
+func TestFileStore_LockNames(t *testing.T) {
+	s, dir := newTestStore(t)
+
+	unlock, err := s.LockNames()
+	if err != nil {
+		t.Fatalf("lock names: %v", err)
+	}
+
+	acquired := make(chan struct{})
+	go func() {
+		u, err := s.LockNames()
+		if err == nil {
+			u()
+		}
+		close(acquired)
+	}()
+
+	select {
+	case <-acquired:
+		t.Fatalf("second names lock acquired while first is held")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	unlock()
+	select {
+	case <-acquired:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("second names lock not acquired after unlock")
+	}
+
+	if names := dirNames(t, dir); len(names) != 0 {
+		t.Fatalf("names lock must leave nothing behind, got %v", names)
+	}
+
+	// 잠금 파일은 레코드 목록에 섞이지 않는다
+	unlock, err = s.LockNames()
+	if err != nil {
+		t.Fatalf("lock names again: %v", err)
+	}
+	defer unlock()
+	if list, err := s.List(); err != nil || len(list) != 0 {
+		t.Fatalf("list while names lock is held = %+v, %v; want empty", list, err)
+	}
+}
+
 func TestFileStore_LockWithoutRecordLeavesNothing(t *testing.T) {
 	s, dir := newTestStore(t)
 

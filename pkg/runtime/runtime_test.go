@@ -911,6 +911,96 @@ func TestResolve_NamePrefixAndAmbiguity(t *testing.T) {
 	}
 }
 
+// 이름은 유일해야 한다: 같은 이름의 두 번째 생성은 흔적 없이 거부되고, 삭제하면 이름을 다시 쓸 수 있다
+func TestCreate_DuplicateNameIsRejected(t *testing.T) {
+	e := newTestEnv(t)
+	ctx := context.Background()
+
+	first, err := e.rt.Create(ctx, CreateOptions{Name: "web"})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	if _, err := e.rt.Create(ctx, CreateOptions{Name: "web"}); !errors.Is(err, ErrNameInUse) {
+		t.Fatalf("second create error = %v, want ErrNameInUse", err)
+	}
+	if _, err := e.rt.Run(ctx, RunOptions{CreateOptions: CreateOptions{Name: "web"}, Detach: true}); !errors.Is(err, ErrNameInUse) {
+		t.Fatalf("run error = %v, want ErrNameInUse", err)
+	}
+	list, err := e.store.List()
+	if err != nil || len(list) != 1 || list[0].ID != first.ID {
+		t.Fatalf("rejected creates must leave only the first container: %+v, %v", list, err)
+	}
+	if ids, _ := e.bundle.List(); len(ids) != 1 {
+		t.Fatalf("rejected creates must not leave bundles behind: %v", ids)
+	}
+
+	// 다른 이름과 이름 없는 컨테이너는 영향받지 않는다
+	other, err := e.rt.Create(ctx, CreateOptions{Name: "db"})
+	if err != nil {
+		t.Fatalf("create with a different name: %v", err)
+	}
+	unnamed1, err := e.rt.Create(ctx, CreateOptions{})
+	if err != nil {
+		t.Fatalf("create unnamed: %v", err)
+	}
+	unnamed2, err := e.rt.Create(ctx, CreateOptions{})
+	if err != nil {
+		t.Fatalf("create second unnamed: %v", err)
+	}
+
+	// 삭제하면 이름이 풀린다
+	if err := e.rt.Delete(ctx, "web", false); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	again, err := e.rt.Create(ctx, CreateOptions{Name: "web"})
+	if err != nil {
+		t.Fatalf("name must be reusable after delete: %v", err)
+	}
+
+	for _, id := range []string{other.ID, unnamed1.ID, unnamed2.ID, again.ID} {
+		if err := e.rt.Delete(ctx, id, false); err != nil {
+			t.Fatalf("delete %s: %v", id, err)
+		}
+	}
+	e.assertNoTrace(t, first.ID) // 이름 잠금 파일도 남지 않는다
+}
+
+// 동시에 같은 이름으로 생성하면 정확히 하나만 성공한다
+func TestCreate_ConcurrentSameNameOnlyOneWins(t *testing.T) {
+	e := newTestEnv(t)
+	ctx := context.Background()
+	const workers = 8
+
+	var wg sync.WaitGroup
+	errs := make([]error, workers)
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_, errs[i] = e.rt.Create(ctx, CreateOptions{Name: "same"})
+		}(i)
+	}
+	wg.Wait()
+
+	succeeded := 0
+	for _, err := range errs {
+		switch {
+		case err == nil:
+			succeeded++
+		case !errors.Is(err, ErrNameInUse):
+			t.Fatalf("unexpected create error: %v", err)
+		}
+	}
+	if succeeded != 1 {
+		t.Fatalf("%d creates succeeded with the same name, want exactly 1", succeeded)
+	}
+	if list, _ := e.store.List(); len(list) != 1 {
+		t.Fatalf("store has %d containers, want 1", len(list))
+	}
+}
+
+// 이름 유일성 도입 이전에 만들어진 중복 이름 레코드: 임의로 고르지 않고 모호함으로 보고한다
 func TestResolve_DuplicateNameIsAmbiguous(t *testing.T) {
 	e := newTestEnv(t)
 	for _, id := range []string{"aaaaaaaaaaaa", "bbbbbbbbbbbb"} {
