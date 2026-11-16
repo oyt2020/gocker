@@ -245,6 +245,19 @@ func TestDispatcher_RunStdioPolicy(t *testing.T) {
 	}
 }
 
+// -d --rm: 시작 직후 삭제되는 컨테이너를 만들지 않도록 런타임을 호출하기 전에 거부한다
+func TestDispatcher_RunRejectsDetachWithRm(t *testing.T) {
+	rt := &mockRuntime{}
+	d := NewDispatcher(rt, nil)
+
+	if err := d.Execute(context.Background(), []string{"run", "-d", "--rm", "alpine", "sleep", "1"}); err == nil {
+		t.Fatalf("expected error for run -d --rm")
+	}
+	if len(rt.runOpts) != 0 {
+		t.Fatalf("runtime must not be called for a rejected run, got %d call(s)", len(rt.runOpts))
+	}
+}
+
 func TestDispatcher_ContainerdSupplierLazy(t *testing.T) {
 	rt := &mockRuntime{}
 	supplierCalled := false

@@ -480,6 +480,22 @@ func TestRun_DetachDoesNotWait(t *testing.T) {
 	}
 }
 
+// detach + remove: 시작 직후 삭제되는 컨테이너를 만들지 않도록, 아무것도 만들기 전에 거부한다
+func TestRun_DetachWithRemoveIsRejected(t *testing.T) {
+	e := newTestEnv(t)
+
+	_, err := e.rt.Run(context.Background(), RunOptions{Detach: true, Remove: true})
+	if !errors.Is(err, ErrDetachWithRemove) {
+		t.Fatalf("run error = %v, want ErrDetachWithRemove", err)
+	}
+	if list, _ := e.store.List(); len(list) != 0 {
+		t.Fatalf("rejected run must not create a container: %+v", list)
+	}
+	if len(e.runc.deleted) != 0 || e.reaper.adoptCount() != 0 {
+		t.Fatalf("rejected run must not touch runc or the reaper")
+	}
+}
+
 // 종료 코드를 얻지 못하면 0으로 뭉개지 않고 에러로 드러낸다
 func TestRun_WaitFailureIsReported(t *testing.T) {
 	e := newTestEnv(t)

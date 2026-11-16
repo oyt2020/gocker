@@ -33,11 +33,15 @@ type CreateOptions struct {
 	Stderr io.Writer
 }
 
+// ErrDetachWithRemove 종료 시 자동 삭제(Remove)는 포그라운드 실행에서만 가능하다.
+// detach된 컨테이너는 gocker보다 오래 살기 때문에, 컨테이너가 끝났을 때 그것을 삭제해 줄 프로세스가 남아 있지 않다.
+var ErrDetachWithRemove = errors.New("remove-on-exit cannot be combined with detach: no process remains to remove the container when it exits")
+
 // RunOptions Run 옵션. 출력 대상은 CreateOptions.Stdout / Stderr를 사용한다.
 type RunOptions struct {
 	CreateOptions
 	Detach bool
-	Remove bool      // --rm
+	Remove bool      // --rm (종료 시 자동 삭제). Detach와 함께 쓸 수 없다 (ErrDetachWithRemove)
 	Stdin  io.Reader // terminal 모드에서 PTY로 전달할 입력 (nil이면 입력 전달 안 함)
 }
 
@@ -326,6 +330,10 @@ func (r *runcRuntime) initPid(id string) (int, error) {
 //
 // 정리(--rm, 시작 실패 후 삭제)가 실패하면 그 에러도 함께 반환한다.
 func (r *runcRuntime) Run(ctx context.Context, opts RunOptions) (result RunResult, err error) {
+	if opts.Detach && opts.Remove {
+		return RunResult{ExitCode: -1}, ErrDetachWithRemove
+	}
+
 	id, err := ensureID(opts.ID)
 	if err != nil {
 		return RunResult{ExitCode: -1}, err

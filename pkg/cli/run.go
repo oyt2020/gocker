@@ -16,7 +16,7 @@ func (d *Dispatcher) handleRun(ctx context.Context, args []string) error {
 
 	name := runCmd.String("name", "", "컨테이너 이름 지정")
 	detach := runCmd.Bool("d", false, "백그라운드에서 실행")
-	rm := runCmd.Bool("rm", false, "컨테이너 종료 시 자동 삭제")
+	rm := runCmd.Bool("rm", false, "컨테이너 종료 시 자동 삭제 (-d와 함께 사용할 수 없음)")
 	tty := runCmd.Bool("t", false, "가상 터미널(TTY) 할당")
 	interactive := runCmd.Bool("i", false, "표준 입력(stdin) 유지")
 	it := runCmd.Bool("it", false, "대화형 가상 터미널 할당 (-i -t)")
@@ -46,6 +46,11 @@ func (d *Dispatcher) handleRun(ctx context.Context, args []string) error {
 	if *it {
 		*tty = true
 		*interactive = true
+	}
+
+	// gocker는 데몬이 없어, 백그라운드 컨테이너가 끝난 뒤 그것을 삭제해 줄 프로세스가 없다
+	if *detach && *rm {
+		return fmt.Errorf("-d와 --rm은 함께 사용할 수 없습니다 (백그라운드 컨테이너는 종료 후 'gocker rm'으로 삭제하세요)")
 	}
 
 	rootfsPath, cmdArgs := image.ResolveArgs(*rootfs, runCmd.Args())
