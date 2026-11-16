@@ -14,6 +14,7 @@ import (
 // RuncClient runc CLI 관리 인터페이스
 type RuncClient interface {
 	Create(ctx context.Context, id, bundleDir, pidFile string, ioOpts *IOOption) error
+	// Start / Kill / Delete / State : 대상 컨테이너가 없으면 ErrNotFound를, ctx 취소/만료로 중단되면 ctx.Err()를 감싼 에러를 반환한다
 	Start(ctx context.Context, id string) error
 	Kill(ctx context.Context, id, signal string) error
 	Delete(ctx context.Context, id string, force bool) error
@@ -84,7 +85,7 @@ func (r *runcClient) Start(ctx context.Context, id string) error {
 	cmd.Stderr = &stderr
 
 	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("runc start failed (%w): %s", err, strings.TrimSpace(stderr.String()))
+		return commandError(ctx, "start", err, stderr.String())
 	}
 	return nil
 }
@@ -99,7 +100,7 @@ func (r *runcClient) Kill(ctx context.Context, id, signal string) error {
 	cmd.Stderr = &stderr
 
 	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("runc kill failed (%w): %s", err, strings.TrimSpace(stderr.String()))
+		return commandError(ctx, "kill", err, stderr.String())
 	}
 	return nil
 }
@@ -117,7 +118,7 @@ func (r *runcClient) Delete(ctx context.Context, id string, force bool) error {
 	cmd.Stderr = &stderr
 
 	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("runc delete failed (%w): %s", err, strings.TrimSpace(stderr.String()))
+		return commandError(ctx, "delete", err, stderr.String())
 	}
 	return nil
 }
@@ -130,7 +131,7 @@ func (r *runcClient) State(ctx context.Context, id string) (*RuncState, error) {
 	cmd.Stderr = &stderr
 
 	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("runc state failed (%w): %s", err, strings.TrimSpace(stderr.String()))
+		return nil, commandError(ctx, "state", err, stderr.String())
 	}
 
 	var state RuncState
