@@ -68,6 +68,9 @@ type runcRuntime struct {
 	runcClient  runc.RuncClient
 	store       store.ContainerStore
 	reaper      reaper.Reaper
+
+	stopPollInterval time.Duration // stop에서 종료 여부를 확인하는 주기
+	killWaitTimeout  time.Duration // SIGKILL 이후 프로세스가 실제로 사라지기를 기다리는 최대 시간
 }
 
 // NewContainerRuntime : ContainerRuntime 생성 (nil 인자는 기본 구현 사용)
@@ -93,6 +96,9 @@ func NewContainerRuntime(bm bundle.BundleManager, sb oci.SpecBuilder, rc runc.Ru
 		runcClient:  rc,
 		store:       st,
 		reaper:      rp,
+
+		stopPollInterval: defaultStopPollInterval,
+		killWaitTimeout:  defaultKillWaitTimeout,
 	}
 }
 
@@ -474,51 +480,6 @@ func (r *runcRuntime) recordExit(id string, exitCode int) error {
 	}
 	meta.ExitCode = &exitCode
 	return r.store.Put(meta)
-}
-
-// stop : `runc stop` 최초 신호는 SIGTERM 시간 초과하면 SIGKILL 신호 전송
-func (r *runcRuntime) stop(ctx context.Context, id string, timeout time.Duration) error {
-	unlock, err := r.store.Lock(id)
-	if err != nil {
-		return err
-	}
-	defer unlock()
-
-	meta, err := r.get(ctx, id)
-	if err != nil {
-		return fmt.Errorf("get metadata: %w", err)
-	}
-
-	if meta.State == StateStopped {
-		return nil
-	}
-
-	if timeout <= 0 {
-		timeout = 10 * time.Second
-	}
-
-	markStopped := func() error {
-		if err := meta.TransitionTo(StateStopped); err != nil {
-			return err
-		}
-		return r.store.Put(meta)
-	}
-
-	// Send SIGTERM
-	_ = r.runcClient.Kill(ctx, id, "SIGTERM")
-
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		state, err := r.runcClient.State(ctx, id)
-		if err != nil || state.Status == runc.StatusStopped {
-			return markStopped()
-		}
-		time.Sleep(200 * time.Millisecond)
-	}
-
-	// 시간 아웃시 SIGKILL 신호로 재전송
-	_ = r.runcClient.Kill(ctx, id, "SIGKILL")
-	return markStopped()
 }
 
 // remove : 컨테이너에 딸린 리소스를 "runc → 번들 → 레코드" 순서로 제거한다.

@@ -63,6 +63,18 @@ type fakeRunc struct {
 	console   *fakeConsole
 	deleted   []string
 	onCreate  func() // Create 진입 시 호출 (호출 순서 검증용)
+
+	keepRunning   bool            // true면 start 후 종료하지 않고 running 상태로 남는다
+	ignoreSignals map[string]bool // 받아도 종료하지 않는 신호
+	signals       []string        // Kill로 전달된 신호 (순서대로)
+	killErr       error
+	stateErr      error
+}
+
+func (f *fakeRunc) sentSignals() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.signals...)
 }
 
 // fakeInitPid : fakeRunc.Create가 pid 파일에 기록하는 컨테이너 init PID
@@ -150,14 +162,31 @@ func (f *fakeRunc) Start(ctx context.Context, id string) error {
 		_, _ = f.console.slave.Write([]byte(f.output))
 		_ = f.console.slave.Close()
 	}
-	f.status[id] = runc.StatusStopped
+	if f.keepRunning {
+		f.status[id] = runc.StatusRunning
+	} else {
+		f.status[id] = runc.StatusStopped
+	}
 	return nil
 }
 
+// Kill / State : 실제 클라이언트처럼 ctx가 끝났으면 ctx 에러를, 컨테이너가 없으면 runc.ErrNotFound를 감싸 반환한다
 func (f *fakeRunc) Kill(ctx context.Context, id, signal string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.status[id] = runc.StatusStopped
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("runc kill interrupted: %w", err)
+	}
+	if f.killErr != nil {
+		return f.killErr
+	}
+	if _, ok := f.status[id]; !ok {
+		return fmt.Errorf("container %q: %w", id, runc.ErrNotFound)
+	}
+	f.signals = append(f.signals, signal)
+	if !f.ignoreSignals[signal] {
+		f.status[id] = runc.StatusStopped
+	}
 	return nil
 }
 
@@ -165,7 +194,7 @@ func (f *fakeRunc) Delete(ctx context.Context, id string, force bool) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if _, ok := f.status[id]; !ok {
-		return fmt.Errorf("container %q does not exist", id)
+		return fmt.Errorf("container %q: %w", id, runc.ErrNotFound)
 	}
 	delete(f.status, id)
 	f.deleted = append(f.deleted, id)
@@ -175,9 +204,15 @@ func (f *fakeRunc) Delete(ctx context.Context, id string, force bool) error {
 func (f *fakeRunc) State(ctx context.Context, id string) (*runc.RuncState, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("runc state interrupted: %w", err)
+	}
+	if f.stateErr != nil {
+		return nil, f.stateErr
+	}
 	s, ok := f.status[id]
 	if !ok {
-		return nil, fmt.Errorf("container %q does not exist", id)
+		return nil, fmt.Errorf("container %q: %w", id, runc.ErrNotFound)
 	}
 	return &runc.RuncState{ID: id, Status: s}, nil
 }
@@ -495,6 +530,199 @@ func TestStartStopTransitions(t *testing.T) {
 	if err := e.rt.Start(ctx, meta.ID); err == nil {
 		t.Fatalf("expected error starting a stopped container")
 	}
+}
+
+// startRunning : 실행 중으로 남는 컨테이너를 만들고, stop의 폴링/대기 시간을 테스트용으로 줄인다
+func (e *testEnv) startRunning(t *testing.T) string {
+	t.Helper()
+	impl := e.rt.(*runcRuntime)
+	impl.stopPollInterval = 5 * time.Millisecond
+	impl.killWaitTimeout = 100 * time.Millisecond
+	e.runc.keepRunning = true
+
+	ctx := context.Background()
+	meta, err := e.rt.Create(ctx, CreateOptions{})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if err := e.rt.Start(ctx, meta.ID); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	return meta.ID
+}
+
+func (e *testEnv) assertStored(t *testing.T, id string, want ContainerState) {
+	t.Helper()
+	stored, err := e.store.Get(id)
+	if err != nil {
+		t.Fatalf("get record: %v", err)
+	}
+	if stored.State != want {
+		t.Fatalf("stored state = %s, want %s", stored.State, want)
+	}
+}
+
+func (e *testEnv) assertSignals(t *testing.T, want ...string) {
+	t.Helper()
+	got := e.runc.sentSignals()
+	if len(got) != len(want) {
+		t.Fatalf("signals = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("signals = %v, want %v", got, want)
+		}
+	}
+}
+
+func TestStop_SigtermStopsContainer(t *testing.T) {
+	e := newTestEnv(t)
+	id := e.startRunning(t)
+
+	if err := e.rt.Stop(context.Background(), id, time.Second); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+	e.assertSignals(t, "SIGTERM")
+	e.assertStored(t, id, StateStopped)
+}
+
+// SIGTERM을 무시하는 컨테이너: timeout 뒤 SIGKILL을 보내고, 종료를 확인한 다음에만 STOPPED를 기록한다
+func TestStop_EscalatesToSigkillAfterTimeout(t *testing.T) {
+	e := newTestEnv(t)
+	id := e.startRunning(t)
+	e.runc.ignoreSignals = map[string]bool{"SIGTERM": true}
+
+	if err := e.rt.Stop(context.Background(), id, 30*time.Millisecond); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+	e.assertSignals(t, "SIGTERM", "SIGKILL")
+	e.assertStored(t, id, StateStopped)
+}
+
+// SIGKILL 이후에도 살아 있으면 STOPPED로 기록하지 않고 에러를 반환한다
+func TestStop_StillRunningAfterSigkillIsError(t *testing.T) {
+	e := newTestEnv(t)
+	id := e.startRunning(t)
+	e.runc.ignoreSignals = map[string]bool{"SIGTERM": true, "SIGKILL": true}
+
+	if err := e.rt.Stop(context.Background(), id, 30*time.Millisecond); err == nil {
+		t.Fatalf("expected error when container survives SIGKILL")
+	}
+	e.assertSignals(t, "SIGTERM", "SIGKILL")
+	e.assertStored(t, id, StateRunning)
+}
+
+// 대기 중 ctx가 취소되면 곧바로 반환하고, 살아 있는 컨테이너를 STOPPED로 기록하지 않는다
+func TestStop_ContextCanceledWhileWaiting(t *testing.T) {
+	e := newTestEnv(t)
+	id := e.startRunning(t)
+	e.runc.ignoreSignals = map[string]bool{"SIGTERM": true}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(50*time.Millisecond, cancel)
+
+	begin := time.Now()
+	err := e.rt.Stop(ctx, id, 30*time.Second)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("stop error = %v, want context.Canceled", err)
+	}
+	if elapsed := time.Since(begin); elapsed > 5*time.Second {
+		t.Fatalf("stop did not return promptly after cancel (took %s)", elapsed)
+	}
+	e.assertSignals(t, "SIGTERM") // 취소 후 SIGKILL로 넘어가지 않는다
+	e.assertStored(t, id, StateRunning)
+}
+
+// 상위 ctx의 기한 만료도 취소와 같다
+func TestStop_ContextDeadlineExceeded(t *testing.T) {
+	e := newTestEnv(t)
+	id := e.startRunning(t)
+	e.runc.ignoreSignals = map[string]bool{"SIGTERM": true}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	if err := e.rt.Stop(ctx, id, 30*time.Second); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("stop error = %v, want context.DeadlineExceeded", err)
+	}
+	e.assertStored(t, id, StateRunning)
+}
+
+// 이미 취소된 ctx: runc 조회가 ctx 에러로 실패해도 그것을 "종료됨"으로 해석하지 않는다
+func TestStop_AlreadyCanceledContext(t *testing.T) {
+	e := newTestEnv(t)
+	id := e.startRunning(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if err := e.rt.Stop(ctx, id, time.Second); !errors.Is(err, context.Canceled) {
+		t.Fatalf("stop error = %v, want context.Canceled", err)
+	}
+	e.assertSignals(t)
+	e.assertStored(t, id, StateRunning)
+}
+
+// runc 조회가 다른 이유로 실패한 경우에도 상태를 알 수 없으므로 STOPPED로 기록하지 않는다
+func TestStop_StateFailureIsNotTreatedAsStopped(t *testing.T) {
+	e := newTestEnv(t)
+	id := e.startRunning(t)
+	e.runc.stateErr = errors.New("runc state failed: permission denied")
+
+	if err := e.rt.Stop(context.Background(), id, time.Second); err == nil {
+		t.Fatalf("expected error when container state is unknown")
+	}
+	e.assertSignals(t)
+	e.assertStored(t, id, StateRunning)
+}
+
+func TestStop_KillFailureIsReported(t *testing.T) {
+	e := newTestEnv(t)
+	id := e.startRunning(t)
+	e.runc.killErr = errors.New("runc kill failed: permission denied")
+
+	err := e.rt.Stop(context.Background(), id, time.Second)
+	if !errors.Is(err, e.runc.killErr) {
+		t.Fatalf("stop error = %v, want kill error", err)
+	}
+	e.assertStored(t, id, StateRunning)
+}
+
+// 스스로 종료한 컨테이너: 신호를 보내지 않고 레코드만 STOPPED로 맞춘다
+func TestStop_AlreadyExitedRecordsStoppedWithoutSignal(t *testing.T) {
+	e := newTestEnv(t)
+	ctx := context.Background()
+
+	meta, err := e.rt.Create(ctx, CreateOptions{})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if err := e.rt.Start(ctx, meta.ID); err != nil { // fakeRunc 기본 동작: start 직후 종료
+		t.Fatalf("start: %v", err)
+	}
+	e.assertStored(t, meta.ID, StateRunning)
+
+	if err := e.rt.Stop(ctx, meta.ID, time.Second); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+	e.assertSignals(t)
+	e.assertStored(t, meta.ID, StateStopped)
+}
+
+// runc 컨테이너가 아예 없으면(재부팅 등) 프로세스도 없으므로 종료된 것으로 본다
+func TestStop_MissingRuncContainerIsStopped(t *testing.T) {
+	e := newTestEnv(t)
+	id := e.startRunning(t)
+
+	e.runc.mu.Lock()
+	delete(e.runc.status, id)
+	e.runc.mu.Unlock()
+
+	if err := e.rt.Stop(context.Background(), id, time.Second); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+	e.assertSignals(t)
+	e.assertStored(t, id, StateStopped)
 }
 
 func TestMissingContainerLeavesNoLockFile(t *testing.T) {
