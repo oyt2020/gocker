@@ -5,8 +5,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -70,6 +72,8 @@ type fakeRunc struct {
 	killErr       error
 	stateErr      error
 	deleteErr     error
+
+	createStdin io.Reader // 마지막 Create에 전달된 표준 입력
 }
 
 func (f *fakeRunc) setDeleteErr(err error) {
@@ -138,6 +142,10 @@ func (f *fakeRunc) Create(ctx context.Context, id, bundleDir, pidFile string, io
 	}
 	if f.createErr != nil {
 		return f.createErr
+	}
+	f.createStdin = nil
+	if ioOpts != nil {
+		f.createStdin = ioOpts.Stdin
 	}
 	// 실제 runc create처럼 컨테이너 init PID를 pid 파일에 기록한다
 	if pidFile != "" {
@@ -477,6 +485,67 @@ func TestRun_DetachDoesNotWait(t *testing.T) {
 	stored, err := e.store.Get(res.ID)
 	if err != nil || stored.ExitCode != nil {
 		t.Fatalf("detached container must have no recorded exit code: %+v, %v", stored, err)
+	}
+}
+
+// 포그라운드 + 가상 터미널 X: 지정한 표준 입력 파일이 그대로 runc create에 전달된다
+func TestRun_ForegroundConnectsStdin(t *testing.T) {
+	e := newTestEnv(t)
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	defer pr.Close()
+	defer pw.Close()
+
+	if _, err := e.rt.Run(context.Background(), RunOptions{Stdin: pr, Remove: true}); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if e.runc.createStdin != io.Reader(pr) {
+		t.Fatalf("runc create stdin = %v, want the given file", e.runc.createStdin)
+	}
+}
+
+// 표준 입력을 지정하지 않으면 runc에 아무것도 넘기지 않는다 (nil 포인터가 든 인터페이스도 안 된다)
+func TestRun_ForegroundWithoutStdinPassesNone(t *testing.T) {
+	e := newTestEnv(t)
+
+	if _, err := e.rt.Run(context.Background(), RunOptions{Remove: true}); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if e.runc.createStdin != nil {
+		t.Fatalf("runc create stdin = %#v, want nil", e.runc.createStdin)
+	}
+}
+
+// detach: 표준 입력을 지정해도 연결하지 않는다
+func TestRun_DetachIgnoresStdin(t *testing.T) {
+	e := newTestEnv(t)
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	defer pr.Close()
+	defer pw.Close()
+
+	if _, err := e.rt.Run(context.Background(), RunOptions{Stdin: pr, Detach: true}); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if e.runc.createStdin != nil {
+		t.Fatalf("detached run must not connect stdin, got %#v", e.runc.createStdin)
+	}
+}
+
+// 가상 터미널 없이 파일이 아닌 입력은 거부한다 (runc create가 입력이 끝날 때까지 반환하지 않게 되므로)
+func TestRun_NonFileStdinIsRejected(t *testing.T) {
+	e := newTestEnv(t)
+
+	_, err := e.rt.Run(context.Background(), RunOptions{Stdin: strings.NewReader("data")})
+	if !errors.Is(err, ErrStdinNotFile) {
+		t.Fatalf("run error = %v, want ErrStdinNotFile", err)
+	}
+	if list, _ := e.store.List(); len(list) != 0 {
+		t.Fatalf("rejected run must not create a container: %+v", list)
 	}
 }
 

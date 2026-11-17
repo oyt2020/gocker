@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"fmt"
+	"os"
 	"testing"
 	"time"
 
@@ -242,6 +243,34 @@ func TestDispatcher_RunStdioPolicy(t *testing.T) {
 	}
 	if fg.Stdin != nil {
 		t.Fatalf("non-tty foreground run must not forward stdin")
+	}
+}
+
+// -i: TTY가 없어도 표준 입력을 컨테이너에 연결한다. detach에서는 연결하지 않는다.
+func TestDispatcher_RunInteractiveStdin(t *testing.T) {
+	rt := &mockRuntime{}
+	d := NewDispatcher(rt, nil)
+	ctx := context.Background()
+
+	if err := d.Execute(ctx, []string{"run", "-i", "--rm", "alpine", "cat"}); err != nil {
+		t.Fatalf("run -i failed: %v", err)
+	}
+	if err := d.Execute(ctx, []string{"run", "-d", "-i", "alpine", "cat"}); err != nil {
+		t.Fatalf("run -d -i failed: %v", err)
+	}
+	if len(rt.runOpts) != 2 {
+		t.Fatalf("expected 2 run calls, got %d", len(rt.runOpts))
+	}
+	interactive, detached := rt.runOpts[0], rt.runOpts[1]
+
+	if interactive.Stdin != os.Stdin {
+		t.Fatalf("run -i must forward the process stdin, got %v", interactive.Stdin)
+	}
+	if interactive.Terminal {
+		t.Fatalf("run -i must not allocate a terminal")
+	}
+	if detached.Stdin != nil {
+		t.Fatalf("detached run must not forward stdin even with -i")
 	}
 }
 

@@ -40,12 +40,20 @@ type CreateOptions struct {
 // detach된 컨테이너는 gocker보다 오래 살기 때문에, 컨테이너가 끝났을 때 그것을 삭제해 줄 프로세스가 남아 있지 않다.
 var ErrDetachWithRemove = errors.New("remove-on-exit cannot be combined with detach: no process remains to remove the container when it exits")
 
+// ErrStdinNotFile 가상 터미널 없이 표준 입력을 연결하려면 *os.File이어야 한다.
+// 파일이 아닌 Reader는 os/exec가 파이프와 복사 고루틴으로 중계하는데, 그러면 `runc create`가 입력이 끝날 때까지 반환하지 않는다.
+var ErrStdinNotFile = errors.New("stdin must be an *os.File when no terminal is allocated")
+
 // RunOptions Run 옵션. 출력 대상은 CreateOptions.Stdout / Stderr를 사용한다.
 type RunOptions struct {
 	CreateOptions
 	Detach bool
-	Remove bool      // --rm (종료 시 자동 삭제). Detach와 함께 쓸 수 없다 (ErrDetachWithRemove)
-	Stdin  io.Reader // terminal 모드에서 PTY로 전달할 입력 (nil이면 입력 전달 안 함)
+	Remove bool // --rm (종료 시 자동 삭제). Detach와 함께 쓸 수 없다 (ErrDetachWithRemove)
+	// Stdin 컨테이너에 전달할 입력 (nil이면 전달하지 않고, 컨테이너의 stdin은 /dev/null이 된다)
+	//   - terminal 모드   : PTY master로 복사한다
+	//   - terminal 아님   : 컨테이너 프로세스의 stdin에 직접 연결한다. *os.File이어야 한다 (ErrStdinNotFile)
+	//   - detach          : 무시한다. 컨테이너가 gocker보다 오래 살고, 나중에 입력을 붙일 수단(attach)이 없다
+	Stdin io.Reader
 }
 
 // RunResult Run 결과
@@ -147,7 +155,7 @@ func (r *runcRuntime) Create(ctx context.Context, opts CreateOptions) (*Containe
 	}
 	opts.ID = id
 
-	meta, master, err := r.create(ctx, opts)
+	meta, master, err := r.create(ctx, opts, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -168,7 +176,10 @@ func (r *runcRuntime) Create(ctx context.Context, opts CreateOptions) (*Containe
 // 남은 리소스는 rm으로 다시 정리할 수 있다.
 //
 // terminal 모드에서는 PTY master를 함께 반환하며 소유권(닫을 책임)은 호출자에게 있다.
-func (r *runcRuntime) create(ctx context.Context, opts CreateOptions) (meta *ContainerMetadata, master *os.File, err error) {
+//
+// stdin이 nil이 아니면 (terminal 모드가 아닐 때) 컨테이너 프로세스의 표준 입력으로 직접 연결한다.
+// 복사 고루틴 없이 fd를 그대로 물려주므로, 입력의 끝(EOF)은 쓰는 쪽이 닫을 때 컨테이너에 자연스럽게 전달된다.
+func (r *runcRuntime) create(ctx context.Context, opts CreateOptions, stdin *os.File) (meta *ContainerMetadata, master *os.File, err error) {
 	id := opts.ID
 
 	unlock, err := r.store.Lock(id)
@@ -237,7 +248,12 @@ func (r *runcRuntime) create(ctx context.Context, opts CreateOptions) (meta *Con
 		defer console.Close()
 		ioOpts.ConsoleSocket = console.Path()
 	} else {
-		// Non-terminal mode: 출력 대상이 지정되지 않으면 container.log 파일로 기록
+		// Non-terminal mode: 입력은 지정된 경우에만 연결 (없으면 runc가 /dev/null을 물려준다).
+		// nil *os.File을 인터페이스에 그대로 넣으면 "nil이 아닌 인터페이스"가 되므로 반드시 nil 검사 후 대입한다.
+		if stdin != nil {
+			ioOpts.Stdin = stdin
+		}
+		// 출력 대상이 지정되지 않으면 container.log 파일로 기록
 		ioOpts.Stdout = opts.Stdout
 		ioOpts.Stderr = opts.Stderr
 		if ioOpts.Stdout == nil || ioOpts.Stderr == nil {
@@ -368,6 +384,16 @@ func (r *runcRuntime) Run(ctx context.Context, opts RunOptions) (result RunResul
 		return RunResult{ExitCode: -1}, ErrDetachWithRemove
 	}
 
+	// 포그라운드 + 가상 터미널 X 에서 컨테이너에 직접 연결할 표준 입력 (아무것도 만들기 전에 검증한다)
+	var stdin *os.File
+	if !opts.Detach && !opts.Terminal && opts.Stdin != nil {
+		f, ok := opts.Stdin.(*os.File)
+		if !ok {
+			return RunResult{ExitCode: -1}, ErrStdinNotFile
+		}
+		stdin = f
+	}
+
 	id, err := ensureID(opts.ID)
 	if err != nil {
 		return RunResult{ExitCode: -1}, err
@@ -393,7 +419,13 @@ func (r *runcRuntime) Run(ctx context.Context, opts RunOptions) (result RunResul
 
 	// 1. 백그라운드 실행 / 2. 포그라운드 + 가상 터미널 X
 	if opts.Detach || !opts.Terminal {
-		if _, err := r.Create(ctx, opts.CreateOptions); err != nil {
+		if opts.Detach {
+			_, err = r.Create(ctx, opts.CreateOptions)
+		} else {
+			// 포그라운드 + 가상 터미널 X: master가 없으므로 닫을 것도 없다
+			_, _, err = r.create(ctx, opts.CreateOptions, stdin)
+		}
+		if err != nil {
 			return result, fmt.Errorf("create container: %w", err)
 		}
 
@@ -426,7 +458,7 @@ func (r *runcRuntime) runWithTerminal(ctx context.Context, opts RunOptions) (exi
 
 	createOpts := opts.CreateOptions
 	createOpts.Terminal = true
-	_, ptyMaster, err := r.create(ctx, createOpts)
+	_, ptyMaster, err := r.create(ctx, createOpts, nil) // 입력은 아래에서 PTY master로 복사한다
 	if err != nil {
 		return -1, fmt.Errorf("create container: %w", err)
 	}

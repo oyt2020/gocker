@@ -18,7 +18,7 @@ func (d *Dispatcher) handleRun(ctx context.Context, args []string) error {
 	detach := runCmd.Bool("d", false, "백그라운드에서 실행")
 	rm := runCmd.Bool("rm", false, "컨테이너 종료 시 자동 삭제 (-d와 함께 사용할 수 없음)")
 	tty := runCmd.Bool("t", false, "가상 터미널(TTY) 할당")
-	interactive := runCmd.Bool("i", false, "표준 입력(stdin) 유지")
+	interactive := runCmd.Bool("i", false, "표준 입력(stdin)을 컨테이너에 연결 (-d에서는 무시됨)")
 	it := runCmd.Bool("it", false, "대화형 가상 터미널 할당 (-i -t)")
 	rootfs := runCmd.String("rootfs", "", "RootFS 아카이브 파일 경로 (기본값: "+image.DefaultRootFS+")")
 	hostname := runCmd.String("hostname", "", "컨테이너 호스트명 지정")
@@ -70,10 +70,12 @@ func (d *Dispatcher) handleRun(ctx context.Context, args []string) error {
 	// stdio 연결 정책은 CLI가 결정한다:
 	//   - detach: 출력 대상을 지정하지 않음 → 런타임이 container.log로 기록 (gocker의 stdout을 물고 있지 않도록)
 	//   - foreground: 컨테이너 출력을 현재 터미널로 연결
+	//   - 표준 입력: TTY(-t)면 키 입력을 전달하기 위해 항상 연결하고, TTY가 아니면 -i를 준 경우에만 연결한다
+	//     (예: echo x | gocker run -i alpine cat). 연결하지 않으면 컨테이너의 stdin은 /dev/null이다.
 	if !*detach {
 		opts.CreateOptions.Stdout = os.Stdout
 		opts.CreateOptions.Stderr = os.Stderr
-		if *tty {
+		if *tty || *interactive {
 			opts.Stdin = os.Stdin
 		}
 	}
