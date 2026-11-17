@@ -153,6 +153,49 @@ run_case "이름으로 rm" $GOCKER rm e2e-dup
 run_case "삭제 후 같은 이름 재사용" $GOCKER create --name e2e-dup alpine sleep 300
 run_case "재사용한 컨테이너 rm" $GOCKER rm e2e-dup
 
+# --- 10. 포그라운드 run 중 gocker가 시그널을 받으면: 컨테이너를 끝내고(SIGTERM → 대기 → SIGKILL) 그 종료 코드로 종료 ---
+# fg_signal <설명> <컨테이너 이름> <시그널> <기대 종료 코드> <출력에 있어야 할 문자열 또는 ''> <gocker run 인자...>
+fg_signal() {
+  local desc="$1" name="$2" sig="$3" want="$4" pat="$5"; shift 5
+  n=$((n + 1))
+  local log="$TMP/$n.log"
+  $GOCKER run --name "$name" "$@" >"$log" 2>&1 </dev/null &
+  local job=$!
+  for _ in $(seq 1 50); do
+    $GOCKER ps | grep -q "$name" && break
+    sleep 0.1
+  done
+  sleep 0.3 # 컨테이너 안의 셸이 trap을 설치할 시간
+  kill -"$sig" "$job"
+  wait "$job"
+  local rc=$?
+  if [ $rc -eq "$want" ] && { [ -z "$pat" ] || grep -q -- "$pat" "$log"; }; then
+    echo "PASS  $desc"
+  else
+    echo "FAIL  $desc (exit=$rc, 기대=$want${pat:+, 출력에 '$pat' 필요})"
+    echo "::group::$desc 출력"; cat "$log"; echo "::endgroup::"
+    FAILED+=("$desc  ->  exit=$rc, 기대=$want")
+  fi
+}
+# SIGTERM / SIGINT 를 받으면 표시를 남기고 종료 코드 7로 끝나는 컨테이너 (정상 정리를 흉내)
+TRAP_SH='trap "echo TRAP-HANDLED; exit 7" TERM INT; while :; do sleep 0.2; done'
+
+fg_signal "run 중 SIGTERM → 컨테이너가 정리 후 종료 (7)" e2e-fg-term TERM 7 TRAP-HANDLED alpine sh -c "$TRAP_SH"
+run_case "SIGTERM 으로 끝난 컨테이너는 -f 없이 rm" $GOCKER rm e2e-fg-term
+fg_signal "run 중 SIGINT → 컨테이너가 정리 후 종료 (7)" e2e-fg-int INT 7 TRAP-HANDLED alpine sh -c "$TRAP_SH"
+run_case "SIGINT 로 끝난 컨테이너는 -f 없이 rm" $GOCKER rm e2e-fg-int
+# sleep은 PID 1이라 SIGTERM을 무시한다 → 유예 시간 뒤 SIGKILL → 137
+fg_signal "run 중 SIGTERM, 컨테이너가 무시 → SIGKILL (137)" e2e-fg-kill TERM 137 '' alpine sleep 300
+run_case "SIGKILL 로 끝난 컨테이너는 -f 없이 rm" $GOCKER rm e2e-fg-kill
+fg_signal "run --rm 중 SIGTERM → 정리 기회를 준 뒤 삭제 (7)" e2e-fg-rm TERM 7 TRAP-HANDLED --rm alpine sh -c "$TRAP_SH"
+n=$((n + 1))
+if [ -z "$($GOCKER ps -a -q)" ]; then
+  echo "PASS  시그널 테스트 후 남은 컨테이너 없음"
+else
+  echo "FAIL  시그널 테스트 후 컨테이너가 남음"
+  FAILED+=("시그널 테스트 후 컨테이너가 남음")
+fi
+
 # --- 결과 ---
 echo
 if [ ${#FAILED[@]} -eq 0 ]; then
