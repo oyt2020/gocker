@@ -74,6 +74,15 @@ type fakeRunc struct {
 	deleteErr     error
 
 	createStdin io.Reader // 마지막 Create에 전달된 표준 입력
+
+	events    []string            // Kill / Delete 호출 순서 ("kill:SIGTERM", "delete")
+	onStopped func(signal string) // 신호로 컨테이너가 종료될 때 호출 (잠금 밖에서)
+}
+
+func (f *fakeRunc) eventLog() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.events...)
 }
 
 func (f *fakeRunc) setDeleteErr(err error) {
@@ -98,6 +107,30 @@ type fakeReaper struct {
 	waited   []int // Wait가 호출된 pid
 	exitCode int
 	waitErr  error
+
+	// running이 nil이 아니면 Wait는 release로 닫힐 때까지 반환하지 않는다 (실행 중인 컨테이너를 흉내)
+	running     chan struct{}
+	releaseOnce sync.Once
+}
+
+// keepRunning : 이후의 Wait가 release 될 때까지 기다리게 한다
+func (f *fakeReaper) keepRunning() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.running = make(chan struct{})
+}
+
+// release : 컨테이너 프로세스가 exitCode로 종료한 상황을 만든다
+func (f *fakeReaper) release(exitCode int) {
+	f.releaseOnce.Do(func() {
+		f.mu.Lock()
+		f.exitCode = exitCode
+		running := f.running
+		f.mu.Unlock()
+		if running != nil {
+			close(running)
+		}
+	})
 }
 
 func (f *fakeReaper) Adopt() error {
@@ -109,8 +142,20 @@ func (f *fakeReaper) Adopt() error {
 
 func (f *fakeReaper) Wait(ctx context.Context, pid int) (int, error) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.waited = append(f.waited, pid)
+	running := f.running
+	f.mu.Unlock()
+
+	if running != nil {
+		select {
+		case <-running:
+		case <-ctx.Done():
+			return -1, ctx.Err()
+		}
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if f.waitErr != nil {
 		return -1, f.waitErr
 	}
@@ -188,19 +233,29 @@ func (f *fakeRunc) Start(ctx context.Context, id string) error {
 // Kill / State : 실제 클라이언트처럼 ctx가 끝났으면 ctx 에러를, 컨테이너가 없으면 runc.ErrNotFound를 감싸 반환한다
 func (f *fakeRunc) Kill(ctx context.Context, id, signal string) error {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	if err := ctx.Err(); err != nil {
+		f.mu.Unlock()
 		return fmt.Errorf("runc kill interrupted: %w", err)
 	}
 	if f.killErr != nil {
+		f.mu.Unlock()
 		return f.killErr
 	}
 	if _, ok := f.status[id]; !ok {
+		f.mu.Unlock()
 		return fmt.Errorf("container %q: %w", id, runc.ErrNotFound)
 	}
 	f.signals = append(f.signals, signal)
-	if !f.ignoreSignals[signal] {
+	f.events = append(f.events, "kill:"+signal)
+	stopped := !f.ignoreSignals[signal]
+	if stopped {
 		f.status[id] = runc.StatusStopped
+	}
+	onStopped := f.onStopped
+	f.mu.Unlock()
+
+	if stopped && onStopped != nil {
+		onStopped(signal)
 	}
 	return nil
 }
@@ -216,6 +271,7 @@ func (f *fakeRunc) Delete(ctx context.Context, id string, force bool) error {
 	}
 	delete(f.status, id)
 	f.deleted = append(f.deleted, id)
+	f.events = append(f.events, "delete")
 	return nil
 }
 
@@ -486,6 +542,140 @@ func TestRun_DetachDoesNotWait(t *testing.T) {
 	if err != nil || stored.ExitCode != nil {
 		t.Fatalf("detached container must have no recorded exit code: %+v, %v", stored, err)
 	}
+}
+
+// cancelEnv : 포그라운드 run이 취소되는 상황을 위한 환경. 컨테이너는 실행 중으로 남고(Wait가 반환하지 않음),
+// 신호로 종료되면 exitCodes에 정한 종료 코드로 Wait가 풀린다. 반환한 ctx는 delay 뒤에 취소된다.
+func cancelEnv(t *testing.T, delay time.Duration, exitCodes map[string]int) (*testEnv, context.Context) {
+	t.Helper()
+	e := newTestEnv(t)
+	impl := e.rt.(*runcRuntime)
+	impl.cancelStopTimeout = 50 * time.Millisecond
+	impl.killWaitTimeout = 100 * time.Millisecond
+
+	e.runc.keepRunning = true
+	e.reaper.keepRunning()
+	e.runc.onStopped = func(signal string) { e.reaper.release(exitCodes[signal]) }
+	t.Cleanup(func() { e.reaper.release(0) }) // 끝까지 종료되지 않는 시나리오의 대기 고루틴 정리
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	time.AfterFunc(delay, cancel)
+	return e, ctx
+}
+
+func assertEvents(t *testing.T, e *testEnv, want ...string) {
+	t.Helper()
+	got := e.runc.eventLog()
+	if len(got) != len(want) {
+		t.Fatalf("runc calls = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("runc calls = %v, want %v", got, want)
+		}
+	}
+}
+
+// 포그라운드 run 중 취소(SIGINT / SIGTERM 수신): 컨테이너에 SIGTERM을 보내 정리할 기회를 주고,
+// 끝날 때까지 기다려 실제 종료 코드를 반환/기록한다. 취소 자체는 에러가 아니다.
+func TestRun_CancelStopsContainerGracefully(t *testing.T) {
+	e, ctx := cancelEnv(t, 30*time.Millisecond, map[string]int{"SIGTERM": 7})
+
+	res, err := e.rt.Run(ctx, RunOptions{})
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if res.ExitCode != 7 {
+		t.Fatalf("exit code = %d, want the container's exit code 7", res.ExitCode)
+	}
+	assertEvents(t, e, "kill:SIGTERM")
+
+	stored, err := e.store.Get(res.ID)
+	if err != nil {
+		t.Fatalf("record missing: %v", err)
+	}
+	if stored.State != StateStopped || stored.ExitCode == nil || *stored.ExitCode != 7 {
+		t.Fatalf("container must be recorded as STOPPED with exit code 7: %+v", stored)
+	}
+}
+
+// SIGTERM을 무시하는 컨테이너: 유예 시간 뒤 SIGKILL로 끝내고 137을 반환한다
+func TestRun_CancelEscalatesToSigkill(t *testing.T) {
+	e, ctx := cancelEnv(t, 30*time.Millisecond, map[string]int{"SIGKILL": 137})
+	e.runc.ignoreSignals = map[string]bool{"SIGTERM": true}
+
+	res, err := e.rt.Run(ctx, RunOptions{})
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if res.ExitCode != 137 {
+		t.Fatalf("exit code = %d, want 137", res.ExitCode)
+	}
+	assertEvents(t, e, "kill:SIGTERM", "kill:SIGKILL")
+	e.assertStored(t, res.ID, StateStopped)
+}
+
+// --rm: 강제 삭제로 곧바로 죽이지 않고, 먼저 SIGTERM으로 끝낸 다음 삭제한다
+func TestRun_CancelWithRemoveStopsBeforeDelete(t *testing.T) {
+	e, ctx := cancelEnv(t, 30*time.Millisecond, map[string]int{"SIGTERM": 7})
+
+	res, err := e.rt.Run(ctx, RunOptions{Remove: true})
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if res.ExitCode != 7 {
+		t.Fatalf("exit code = %d, want 7", res.ExitCode)
+	}
+	assertEvents(t, e, "kill:SIGTERM", "delete")
+	e.assertNoTrace(t, res.ID)
+}
+
+// 가상 터미널 모드에서도 같다
+func TestRun_TerminalCancelStopsContainer(t *testing.T) {
+	e, ctx := cancelEnv(t, 30*time.Millisecond, map[string]int{"SIGTERM": 7})
+
+	res, err := e.rt.Run(ctx, RunOptions{CreateOptions: CreateOptions{Terminal: true}})
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if res.ExitCode != 7 {
+		t.Fatalf("exit code = %d, want 7", res.ExitCode)
+	}
+	assertEvents(t, e, "kill:SIGTERM")
+	e.assertStored(t, res.ID, StateStopped)
+}
+
+// SIGKILL 이후에도 끝나지 않으면 무한정 기다리지 않고 에러로 보고한다 (STOPPED로 기록하지 않는다)
+func TestRun_CancelStillRunningAfterSigkillIsError(t *testing.T) {
+	e, ctx := cancelEnv(t, 30*time.Millisecond, nil)
+	e.runc.ignoreSignals = map[string]bool{"SIGTERM": true, "SIGKILL": true}
+
+	begin := time.Now()
+	res, err := e.rt.Run(ctx, RunOptions{})
+	if err == nil {
+		t.Fatalf("expected error when the container survives SIGKILL")
+	}
+	if elapsed := time.Since(begin); elapsed > 5*time.Second {
+		t.Fatalf("run did not give up promptly (took %s)", elapsed)
+	}
+	if res.ExitCode != -1 {
+		t.Fatalf("exit code = %d, want -1", res.ExitCode)
+	}
+	assertEvents(t, e, "kill:SIGTERM", "kill:SIGKILL")
+	e.assertStored(t, res.ID, StateRunning)
+}
+
+// 취소되지 않으면 신호를 보내지 않는다 (스스로 끝난 컨테이너의 종료 코드를 그대로 반환)
+func TestRun_NoCancelSendsNoSignal(t *testing.T) {
+	e := newTestEnv(t)
+	e.reaper.exitCode = 5
+
+	res, err := e.rt.Run(context.Background(), RunOptions{})
+	if err != nil || res.ExitCode != 5 {
+		t.Fatalf("run = %+v, %v; want exit code 5", res, err)
+	}
+	assertEvents(t, e)
 }
 
 // 포그라운드 + 가상 터미널 X: 지정한 표준 입력 파일이 그대로 runc create에 전달된다

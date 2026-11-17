@@ -40,6 +40,10 @@ type RunResult struct {
 }
 
 const (
+	// defaultCancelStopTimeout 포그라운드 실행이 취소되었을 때 SIGTERM 이후 종료를 기다리는 기본 시간.
+	// 사용자가 Ctrl+C를 누르고 기다리는 상황이므로 stop의 기본 타임아웃(10초)보다 짧게 잡는다.
+	defaultCancelStopTimeout = 2 * time.Second
+
 	// ptyDrainTimeout 컨테이너 종료 후 PTY 출력이 자연 종료(EIO)되기를 기다리는 최대 시간
 	ptyDrainTimeout = 500 * time.Millisecond
 )
@@ -49,6 +53,9 @@ const (
 // 포그라운드(detach가 아님)에서는 컨테이너가 끝날 때까지 기다려 종료 코드를 반환한다. 이를 위해 gocker가
 // child subreaper가 되어 컨테이너 init 프로세스를 입양하고 직접 wait한다 (pkg/reaper 참고).
 // detach에서는 gocker가 컨테이너보다 먼저 종료하므로 종료 코드를 수거할 프로세스가 없다 (데몬/shim이 없는 구조의 한계).
+//
+// 포그라운드 실행 중 ctx가 취소되면 컨테이너를 SIGTERM → (대기) → SIGKILL 순으로 끝낸 뒤 그 종료 코드를 반환한다
+// (waitForExit 참고). 컨테이너를 남겨 둔 채 반환하지 않는다.
 //
 // 정리(--rm, 시작 실패 후 삭제)가 실패하면 그 에러도 함께 반환한다.
 func (r *runcRuntime) Run(ctx context.Context, opts RunOptions) (result RunResult, err error) {
@@ -195,26 +202,80 @@ func (r *runcRuntime) runWithTerminal(ctx context.Context, opts RunOptions) (exi
 	return exitCode, exitErr
 }
 
+// exitResult 컨테이너 init 프로세스의 wait 결과
+type exitResult struct {
+	exitCode int
+	err      error
+}
+
 // waitForExit : 입양한 컨테이너 init 프로세스가 끝날 때까지 기다려 종료 상태를 수거(reap)하고,
 // 종료 코드를 레코드에 남긴 뒤 반환한다. 호출 전에 reaper.Adopt가 `runc create`보다 먼저 불려 있어야 한다.
 //
 // 컨테이너가 이미 끝났어도 수거 전까지는 좀비로 남아 있으므로 종료 코드를 놓치지 않는다.
 // 종료 코드를 얻었지만 기록에 실패하면 종료 코드와 에러를 함께 반환한다.
+//
+// ctx가 취소되면(gocker가 SIGINT / SIGTERM을 받은 경우 등) 기다리기를 그만두는 대신 컨테이너를 끝낸다 (terminate).
+// 포그라운드 컨테이너는 gocker와 수명을 같이한다: 그대로 반환하면 컨테이너가 돌볼 프로세스 없이 남고 종료 코드도 잃는다.
+// 이 경우에도 반환값은 컨테이너의 실제 종료 코드이며, 취소 자체는 에러로 보고하지 않는다.
 func (r *runcRuntime) waitForExit(ctx context.Context, id string) (int, error) {
 	pid, err := r.initPid(id)
 	if err != nil {
 		return -1, fmt.Errorf("find container process: %w", err)
 	}
 
-	exitCode, err := r.reaper.Wait(ctx, pid)
-	if err != nil {
-		return -1, fmt.Errorf("wait container process: %w", err)
+	// wait는 ctx와 무관하게 끝까지 유지한다. 종료 상태는 한 번만 수거할 수 있으므로, 취소되었다고 wait를 버리면
+	// 그 뒤에 컨테이너를 멈추더라도 종료 코드를 얻을 방법이 없다.
+	exited := make(chan exitResult, 1)
+	go func() {
+		code, err := r.reaper.Wait(context.Background(), pid)
+		exited <- exitResult{code, err}
+	}()
+
+	var res exitResult
+	select {
+	case res = <-exited:
+	case <-ctx.Done():
+		res = r.terminate(id, exited)
+	}
+	if res.err != nil {
+		return -1, fmt.Errorf("wait container process: %w", res.err)
 	}
 
-	if err := r.recordExit(id, exitCode); err != nil {
-		return exitCode, fmt.Errorf("record exit code: %w", err)
+	if err := r.recordExit(id, res.exitCode); err != nil {
+		return res.exitCode, fmt.Errorf("record exit code: %w", err)
 	}
-	return exitCode, nil
+	return res.exitCode, nil
+}
+
+// terminate : 취소된 포그라운드 실행의 컨테이너를 끝내고 wait 결과를 반환한다.
+// stop과 같은 절차다: SIGTERM을 보내 스스로 정리할 기회를 주고, cancelStopTimeout 안에 끝나지 않으면 SIGKILL을 보낸다.
+//
+// stop과 달리 runc 상태를 폴링하지 않는다. gocker가 컨테이너의 부모이므로 exited(wait 결과)가 종료 순간을 정확히 알려준다.
+// 호출자의 ctx는 이미 취소되어 runc 명령에 쓸 수 없으므로 별도의 컨텍스트를 쓴다.
+func (r *runcRuntime) terminate(id string, exited <-chan exitResult) exitResult {
+	ctx := context.Background()
+
+	// 신호 전송이 실패해도 멈추지 않는다: SIGTERM을 못 보냈으면 바로 SIGKILL로 넘어가고,
+	// 끝내 종료를 확인하지 못했을 때 그 원인으로 함께 보고한다.
+	termErr := r.signal(ctx, id, "SIGTERM")
+	if termErr == nil {
+		select {
+		case res := <-exited:
+			return res
+		case <-time.After(r.cancelStopTimeout):
+		}
+	}
+
+	killErr := r.signal(ctx, id, "SIGKILL")
+	select {
+	case res := <-exited:
+		return res
+	case <-time.After(r.killWaitTimeout):
+		return exitResult{-1, errors.Join(
+			fmt.Errorf("container %q is still running %s after SIGKILL", id, r.killWaitTimeout),
+			termErr, killErr,
+		)}
+	}
 }
 
 // recordExit : 수거한 종료 코드를 레코드에 남기고 STOPPED로 전환한다.

@@ -56,8 +56,9 @@ type runcRuntime struct {
 	store       store.ContainerStore
 	reaper      reaper.Reaper
 
-	stopPollInterval time.Duration // stop에서 종료 여부를 확인하는 주기
-	killWaitTimeout  time.Duration // SIGKILL 이후 프로세스가 실제로 사라지기를 기다리는 최대 시간
+	stopPollInterval  time.Duration // stop에서 종료 여부를 확인하는 주기
+	killWaitTimeout   time.Duration // SIGKILL 이후 프로세스가 실제로 사라지기를 기다리는 최대 시간
+	cancelStopTimeout time.Duration // 포그라운드 실행이 취소되었을 때 SIGTERM 이후 종료를 기다리는 시간
 }
 
 // NewContainerRuntime : ContainerRuntime 생성 (nil 인자는 기본 구현 사용)
@@ -84,8 +85,9 @@ func NewContainerRuntime(bm bundle.BundleManager, sb oci.SpecBuilder, rc runc.Ru
 		store:       st,
 		reaper:      rp,
 
-		stopPollInterval: defaultStopPollInterval,
-		killWaitTimeout:  defaultKillWaitTimeout,
+		stopPollInterval:  defaultStopPollInterval,
+		killWaitTimeout:   defaultKillWaitTimeout,
+		cancelStopTimeout: defaultCancelStopTimeout,
 	}
 }
 
