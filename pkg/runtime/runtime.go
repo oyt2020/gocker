@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -11,53 +12,57 @@ import (
 
 	"github.com/oyt2020/gocker/pkg/bundle"
 	"github.com/oyt2020/gocker/pkg/oci"
+	"github.com/oyt2020/gocker/pkg/reaper"
 	"github.com/oyt2020/gocker/pkg/runc"
+	"github.com/oyt2020/gocker/pkg/store"
 	"github.com/oyt2020/gocker/pkg/util"
-	"golang.org/x/term"
 )
+
+// ErrNameInUse 같은 이름을 가진 컨테이너가 이미 존재한다 (이름은 컨테이너 사이에서 유일해야 한다)
+var ErrNameInUse = errors.New("container name already in use")
 
 // CreateOptions Create 옵션
 type CreateOptions struct {
-	ID            string
-	Name          string
+	ID            string // 비어 있으면 런타임이 생성한다
+	Name          string // 비어 있지 않으면 다른 컨테이너와 겹칠 수 없다 (ErrNameInUse)
 	RootfsTarPath string
 	Command       []string
 	Env           []string
 	Terminal      bool
 	Hostname      string
-	Stdout        io.Writer
-	Stderr        io.Writer
-}
-
-// RunOptions Run 옵션 (CreateOptions 포함됨)
-type RunOptions struct {
-	CreateOptions
-	Detach bool
-	Remove bool // --rm
-	Stdin  io.Reader
+	// Stdout / Stderr 컨테이너 출력 대상. nil이면 non-terminal 모드에서는 container.log로 기록된다.
+	// runc 자식 프로세스에 직접 연결되므로 *os.File을 권장한다 (파이프 복사 고루틴 / FD 상속 데드락 방지).
 	Stdout io.Writer
 	Stderr io.Writer
 }
 
-// ContainerRuntime runc 관리 인터페이스
+// ContainerRuntime 컨테이너 라이프사이클 관리 인터페이스 (CLI에 대한 API 경계)
+// 터미널 제어(raw 모드 등)는 호출자(CLI)의 책임이며, 런타임은 주입받은 스트림만 사용한다.
+// ref는 컨테이너 참조(전체 ID / ID 접두어 / 이름)이며, 전체 ID로의 해석은 런타임이 한다 (resolve.go).
 type ContainerRuntime interface {
 	Create(ctx context.Context, opts CreateOptions) (*ContainerMetadata, error)
-	Start(ctx context.Context, id string) error
-	Run(ctx context.Context, opts RunOptions) (int, error)
-	Stop(ctx context.Context, id string, timeout time.Duration) error
-	Delete(ctx context.Context, id string, force bool) error
+	Start(ctx context.Context, ref string) error
+	Run(ctx context.Context, opts RunOptions) (RunResult, error)
+	Stop(ctx context.Context, ref string, timeout time.Duration) error
+	Delete(ctx context.Context, ref string, force bool) error
 	List(ctx context.Context, all bool) ([]*ContainerMetadata, error)
-	Get(ctx context.Context, id string) (*ContainerMetadata, error)
+	Get(ctx context.Context, ref string) (*ContainerMetadata, error)
 }
 
 type runcRuntime struct {
 	bundleMgr   bundle.BundleManager
 	specBuilder oci.SpecBuilder
 	runcClient  runc.RuncClient
+	store       store.ContainerStore
+	reaper      reaper.Reaper
+
+	stopPollInterval  time.Duration // stop에서 종료 여부를 확인하는 주기
+	killWaitTimeout   time.Duration // SIGKILL 이후 프로세스가 실제로 사라지기를 기다리는 최대 시간
+	cancelStopTimeout time.Duration // 포그라운드 실행이 취소되었을 때 SIGTERM 이후 종료를 기다리는 시간
 }
 
-// NewContainerRuntime : ContainerRuntime 생성
-func NewContainerRuntime(bm bundle.BundleManager, sb oci.SpecBuilder, rc runc.RuncClient) ContainerRuntime {
+// NewContainerRuntime : ContainerRuntime 생성 (nil 인자는 기본 구현 사용)
+func NewContainerRuntime(bm bundle.BundleManager, sb oci.SpecBuilder, rc runc.RuncClient, st store.ContainerStore, rp reaper.Reaper) ContainerRuntime {
 	if bm == nil {
 		bm = bundle.NewBundleManager(nil)
 	}
@@ -67,93 +72,124 @@ func NewContainerRuntime(bm bundle.BundleManager, sb oci.SpecBuilder, rc runc.Ru
 	if rc == nil {
 		rc = runc.NewRuncClient("")
 	}
+	if st == nil {
+		st = store.NewFileStore(bm.Layout().StateDir())
+	}
+	if rp == nil {
+		rp = reaper.New()
+	}
 	return &runcRuntime{
 		bundleMgr:   bm,
 		specBuilder: sb,
 		runcClient:  rc,
+		store:       st,
+		reaper:      rp,
+
+		stopPollInterval:  defaultStopPollInterval,
+		killWaitTimeout:   defaultKillWaitTimeout,
+		cancelStopTimeout: defaultCancelStopTimeout,
 	}
 }
 
-const (
-	// masterRecvTimeout runc create 이후 PTY master fd 수신을 기다리는 최대 시간
-	masterRecvTimeout = 5 * time.Second
-	// ptyDrainTimeout 컨테이너 종료 후 PTY 출력이 자연 종료(EIO)되기를 기다리는 최대 시간
-	ptyDrainTimeout = 500 * time.Millisecond
-)
-
-// masterResult PTY Master FD 수신 결과
-type masterResult struct {
-	file *os.File
-	err  error
-}
-
-// startMasterReceiver : consoleSock에서 PTY master fd를 백그라운드로 수신한다.
-// 반환되는 drain은 결과를 아직 채널에서 꺼내지 않은 경로(실패/타임아웃)에서만 호출해야 한다.
-// 이미 꺼낸 뒤 호출하면 채널이 비어 있어 영구 블로킹된다.
-func startMasterReceiver(consoleSock *runc.ConsoleSocket) (<-chan masterResult, func()) {
-	ch := make(chan masterResult, 1)
-	go func() {
-		f, err := consoleSock.ReceiveMaster()
-		ch <- masterResult{file: f, err: err}
-	}()
-
-	drain := func() {
-		// 리스너와 수락된 연결을 함께 닫아 AcceptUnix / ReadMsgUnix 대기 중인 고루틴을 깨운다
-		_ = consoleSock.Close()
-		// 수신 고루틴이 종료될 때까지 동기적으로 회수하고, 늦게 도착한 fd가 있으면 닫는다
-		if res := <-ch; res.file != nil {
-			_ = res.file.Close()
-		}
+// ensureID : ID가 비어 있으면 새로 생성한다 (ID 생성은 런타임의 책임)
+func ensureID(id string) (string, error) {
+	if id != "" {
+		return id, nil
 	}
-	return ch, drain
+	newID, err := util.GenerateID()
+	if err != nil {
+		return "", fmt.Errorf("generate id: %w", err)
+	}
+	return newID, nil
 }
 
-// waitMaster : master fd 수신을 기다린다. ctx 취소 / 타임아웃 시 drain으로 수신 고루틴과 늦게 온 fd를 회수한다.
-func waitMaster(ctx context.Context, ch <-chan masterResult, drain func()) (*os.File, error) {
-	select {
-	case res := <-ch:
-		if res.err != nil {
-			if res.file != nil {
-				_ = res.file.Close()
-			}
-			return nil, res.err
-		}
-		return res.file, nil
-	case <-ctx.Done():
-		drain()
-		return nil, ctx.Err()
-	case <-time.After(masterRecvTimeout):
-		drain()
-		return nil, fmt.Errorf("timeout waiting for pty master from runc (%s expired)", masterRecvTimeout)
+// newMetadata : CREATED 상태의 메타데이터 생성
+func newMetadata(id string, opts CreateOptions, bundlePath string) *ContainerMetadata {
+	return &ContainerMetadata{
+		ID:         id,
+		Name:       opts.Name,
+		CreatedAt:  time.Now().UTC(),
+		Image:      opts.RootfsTarPath,
+		Command:    opts.Command,
+		BundlePath: bundlePath,
+		State:      StateCreated,
 	}
 }
 
 // Create : `runc create` 명령어 실행 + 번들 디렉터리, config.json 준비
 func (r *runcRuntime) Create(ctx context.Context, opts CreateOptions) (*ContainerMetadata, error) {
+	id, err := ensureID(opts.ID)
+	if err != nil {
+		return nil, err
+	}
+	opts.ID = id
+
+	meta, master, err := r.create(ctx, opts, nil)
+	if err != nil {
+		return nil, err
+	}
+	if master != nil {
+		// gocker는 데몬이 없으므로 master를 유지하지 않는다: 여기서 닫혀 이후 start는 실패한다(의도된 동작)
+		_ = master.Close()
+	}
+	return meta, nil
+}
+
+// create : 컨테이너를 CREATED 상태까지 만든다 (opts.ID는 이미 할당되어 있어야 한다).
+//
+// 순서는 "레코드 → 번들 → runc" 이고 롤백은 그 역순이다. 레코드를 가장 먼저 쓰기 때문에 도중에 프로세스가
+// 죽어도 컨테이너가 목록에 보이고 rm으로 정리할 수 있다 (Delete는 없는 번들/runc 컨테이너를 허용한다).
+// 전체 과정은 컨테이너 잠금으로 보호되므로, 만들어지는 중인 컨테이너에 대한 start/stop/rm은 완료까지 대기한다.
+//
+// 롤백 자체가 실패하면 그 에러도 함께 반환한다. 이때 롤백은 실패한 지점에서 멈추므로 레코드가 남고,
+// 남은 리소스는 rm으로 다시 정리할 수 있다.
+//
+// terminal 모드에서는 PTY master를 함께 반환하며 소유권(닫을 책임)은 호출자에게 있다.
+//
+// stdin이 nil이 아니면 (terminal 모드가 아닐 때) 컨테이너 프로세스의 표준 입력으로 직접 연결한다.
+// 복사 고루틴 없이 fd를 그대로 물려주므로, 입력의 끝(EOF)은 쓰는 쪽이 닫을 때 컨테이너에 자연스럽게 전달된다.
+func (r *runcRuntime) create(ctx context.Context, opts CreateOptions, stdin *os.File) (meta *ContainerMetadata, master *os.File, err error) {
 	id := opts.ID
-	if id == "" {
-		newID, err := util.GenerateID()
-		if err != nil {
-			return nil, fmt.Errorf("generate id: %w", err)
-		}
-		id = newID
+
+	unlock, err := r.store.Lock(id)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer unlock()
+
+	if _, err := r.store.Get(id); err == nil {
+		return nil, nil, fmt.Errorf("container %q already exists", id)
+	} else if !errors.Is(err, store.ErrNotFound) {
+		return nil, nil, err
 	}
 
 	rollback := NewRollbackTracker()
 	defer func() {
-		_ = rollback.Rollback()
+		// 성공 경로에서는 Commit으로 비워져 있어 아무것도 실행되지 않는다
+		if rbErr := rollback.Rollback(); rbErr != nil {
+			err = errors.Join(err, fmt.Errorf("container %s is left behind, remove it with 'gocker rm': %w", id, rbErr))
+		}
 	}()
 
-	// 1. 번들 디렉터리 생성 및 rootfs.tar.gz 압축 해제
+	// 1. 메타데이터 레코드 저장 (컨테이너의 존재와 이름을 선언)
+	meta = newMetadata(id, opts, r.bundleMgr.Layout().BundleDir(id))
+	if err := r.reserve(meta); err != nil {
+		return nil, nil, err
+	}
+	rollback.Add(func() error {
+		return r.store.Delete(id)
+	})
+
+	// 2. 번들 디렉터리 생성 및 rootfs.tar.gz 압축 해제
 	b, err := r.bundleMgr.Create(id, opts.RootfsTarPath)
 	if err != nil {
-		return nil, fmt.Errorf("create bundle: %w", err)
+		return nil, nil, fmt.Errorf("create bundle: %w", err)
 	}
 	rollback.Add(func() error {
 		return r.bundleMgr.Delete(id)
 	})
 
-	// 2. OCI config.json 생성 및 저장
+	// 3. OCI config.json 생성 및 저장
 	spec, err := r.specBuilder.Build(oci.SpecOptions{
 		Args:     opts.Command,
 		Env:      opts.Env,
@@ -162,112 +198,110 @@ func (r *runcRuntime) Create(ctx context.Context, opts CreateOptions) (*Containe
 		RootFS:   bundle.RootFSDirName,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("build oci spec: %w", err)
+		return nil, nil, fmt.Errorf("build oci spec: %w", err)
 	}
-
 	if err := r.specBuilder.SaveToFile(spec, b.ConfigPath); err != nil {
-		return nil, fmt.Errorf("save config.json: %w", err)
+		return nil, nil, fmt.Errorf("save config.json: %w", err)
 	}
 
-	// 3. I/O 옵션 준비
-	var ioOpts *runc.IOOption
-	var logFile *os.File
-	var masterCh <-chan masterResult
-	// drainMaster : 실패/타임아웃 경로에서 수신 고루틴이 늦게 전달하는 master fd까지 확실히 회수하여 닫는다.
-	var drainMaster func()
-
+	// 4. I/O 옵션 준비
+	ioOpts := &runc.IOOption{RuncLogPath: b.RuncLogPath}
+	var console runc.Console
 	if opts.Terminal {
-		// Terminal (PTY) mode: Master FD를 위한 콘솔 소켓 생성
-		consoleSock, err := runc.NewConsoleSocket("")
+		// Terminal (PTY) mode: master fd 수신 절차는 runc 계층(Console)이 맡는다.
+		// Close는 어떤 반환 경로에서든 안전하며, 넘겨받지 못한 master가 있으면 함께 회수한다.
+		console, err = r.runcClient.NewConsole()
 		if err != nil {
-			return nil, fmt.Errorf("create console socket: %w", err)
+			return nil, nil, fmt.Errorf("create console: %w", err)
 		}
-		defer consoleSock.Close()
-		ioOpts = &runc.IOOption{
-			ConsoleSocket: consoleSock.Path(),
-			RuncLogPath:   b.RuncLogPath,
-		}
-
-		// runc가 create 시 전송하는 PTY master fd를 백그라운드에서 수신 대기 (데드락 및 Broken pipe 방지)
-		// 주의: runc create가 완료되기 전에 master fd를 닫으면 커널이 PTY를 hangup(EIO)시키므로 채널로 전달 후 닫는다.
-		masterCh, drainMaster = startMasterReceiver(consoleSock)
+		defer console.Close()
+		ioOpts.ConsoleSocket = console.Path()
 	} else {
-		// Non-terminal mode: Stdout, Stderr를 container.log 파일로 지정
-		out := opts.Stdout
-		errOut := opts.Stderr
-		if out == nil || errOut == nil {
+		// Non-terminal mode: 입력은 지정된 경우에만 연결 (없으면 runc가 /dev/null을 물려준다).
+		// nil *os.File을 인터페이스에 그대로 넣으면 "nil이 아닌 인터페이스"가 되므로 반드시 nil 검사 후 대입한다.
+		if stdin != nil {
+			ioOpts.Stdin = stdin
+		}
+		// 출력 대상이 지정되지 않으면 container.log 파일로 기록
+		ioOpts.Stdout = opts.Stdout
+		ioOpts.Stderr = opts.Stderr
+		if ioOpts.Stdout == nil || ioOpts.Stderr == nil {
 			lf, err := os.OpenFile(b.LogPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 			if err != nil {
-				return nil, fmt.Errorf("open container log file: %w", err)
+				return nil, nil, fmt.Errorf("open container log file: %w", err)
 			}
-			logFile = lf
-			if out == nil {
-				out = lf
+			defer lf.Close()
+			if ioOpts.Stdout == nil {
+				ioOpts.Stdout = lf
 			}
-			if errOut == nil {
-				errOut = lf
+			if ioOpts.Stderr == nil {
+				ioOpts.Stderr = lf
 			}
 		}
-		ioOpts = &runc.IOOption{
-			Stdout:      out,
-			Stderr:      errOut,
-			RuncLogPath: b.RuncLogPath,
-		}
-	}
-	if logFile != nil {
-		defer logFile.Close()
 	}
 
-	// 4. `runc create` 호출
+	// 5. `runc create` 호출
 	if err := r.runcClient.Create(ctx, id, b.Path, b.PidFilePath, ioOpts); err != nil {
-		if drainMaster != nil {
-			drainMaster()
-		}
-		return nil, fmt.Errorf("runc create: %w", err)
+		return nil, nil, fmt.Errorf("runc create: %w", err)
 	}
 	// runc create 성공 직후 롤백 등록: 이후 어떤 실패 경로에서도 runc 컨테이너가 고아로 남지 않도록 한다.
 	rollback.Add(func() error {
 		return r.runcClient.Delete(context.Background(), id, true)
 	})
 
-	if masterCh != nil {
-		master, err := waitMaster(ctx, masterCh, drainMaster)
+	// 6. terminal 모드: runc가 보낸 PTY master 수신
+	if console != nil {
+		master, err = console.WaitMaster(ctx)
 		if err != nil {
-			return nil, fmt.Errorf("receive pty master during create: %w", err)
+			return nil, nil, fmt.Errorf("receive pty master: %w", err)
 		}
-		// gocker는 데몬이 없으므로 master를 유지하지 않는다: Create 종료 시 닫혀 이후 start는 실패한다(의도된 동작)
-		defer master.Close()
-	}
-
-	// 4. metadata.json 저장
-	meta := &ContainerMetadata{
-		ID:         id,
-		Name:       opts.Name,
-		CreatedAt:  time.Now().UTC(),
-		Image:      opts.RootfsTarPath,
-		Command:    opts.Command,
-		BundlePath: b.Path,
-		State:      StateCreated,
-		Pid:        0,
-	}
-
-	if err := SaveMetadata(meta, b.MetaPath); err != nil {
-		return nil, fmt.Errorf("save container metadata: %w", err)
 	}
 
 	// Success: 롤백 함수 제거
 	rollback.Commit()
-	return meta, nil
+	return meta, master, nil
 }
 
-// Start : `runc start` 명령어 실행
-func (r *runcRuntime) Start(ctx context.Context, id string) error {
-	b, err := r.bundleMgr.Get(id)
+// reserve : 새 컨테이너의 레코드를 기록한다.
+//
+// 이름이 있으면 다른 컨테이너가 이미 쓰고 있는지 확인하고, 쓰고 있으면 ErrNameInUse를 반환한다.
+// "중복 검사 → 기록"은 저장소 전역 잠금으로 묶여 있어, 동시에 실행된 다른 gocker 프로세스가 같은 이름을 차지할 수 없다.
+// 잠금은 기록 직후 풀리므로 이후의 느린 단계(rootfs 압축 해제, runc create)가 다른 컨테이너의 생성을 막지 않는다.
+// 이름은 레코드와 함께 사라지므로, 컨테이너를 삭제하면 그 이름을 다시 쓸 수 있다.
+func (r *runcRuntime) reserve(meta *ContainerMetadata) error {
+	if meta.Name != "" {
+		unlock, err := r.store.LockNames()
+		if err != nil {
+			return err
+		}
+		defer unlock()
+
+		existing, err := r.store.List()
+		if err != nil {
+			return fmt.Errorf("list containers: %w", err)
+		}
+		for _, other := range existing {
+			if other.Name == meta.Name {
+				return fmt.Errorf("container name %q is already in use by container %s: %w", meta.Name, other.ID, ErrNameInUse)
+			}
+		}
+	}
+
+	if err := r.store.Put(meta); err != nil {
+		return fmt.Errorf("save container metadata: %w", err)
+	}
+	return nil
+}
+
+// start : `runc start` 명령어 실행
+func (r *runcRuntime) start(ctx context.Context, id string) error {
+	unlock, err := r.store.Lock(id)
 	if err != nil {
 		return err
 	}
+	defer unlock()
 
-	meta, err := r.Get(ctx, id)
+	meta, err := r.get(ctx, id)
 	if err != nil {
 		return fmt.Errorf("get metadata: %w", err)
 	}
@@ -275,280 +309,52 @@ func (r *runcRuntime) Start(ctx context.Context, id string) error {
 	if meta.State == StateRunning {
 		return fmt.Errorf("container %q is already running", id)
 	}
+	if !meta.State.CanTransitionTo(StateRunning) {
+		return fmt.Errorf("container %q cannot be started from %s state", id, meta.State)
+	}
 
 	if err := r.runcClient.Start(ctx, id); err != nil {
 		return fmt.Errorf("runc start: %w", err)
 	}
 
-	// 컨테이너 메인 프로세스 PID 가져오기
-	pid := 0
-	if pidData, err := os.ReadFile(b.PidFilePath); err == nil {
-		if p, err := strconv.Atoi(strings.TrimSpace(string(pidData))); err == nil {
-			pid = p
-		}
-	}
+	// 컨테이너 메인 프로세스 PID 가져오기 (읽지 못해도 시작은 성공이며, 조회 시 runc 관측 값으로 채워진다)
+	pid, _ := r.initPid(id)
 
-	meta.State = StateRunning
-	meta.Pid = pid
-	return SaveMetadata(meta, b.MetaPath)
-}
-
-// Run : `runc create` + `runc start` 를 동시에 수행
-func (r *runcRuntime) Run(ctx context.Context, opts RunOptions) (int, error) {
-	if opts.Remove {
-		defer func() {
-			if opts.ID != "" {
-				_ = r.Delete(context.Background(), opts.ID, true)
-			}
-		}()
-	}
-
-	// 1. 백그라운드 실행
-	if opts.Detach {
-		meta, err := r.Create(ctx, opts.CreateOptions)
-		if err != nil {
-			return -1, fmt.Errorf("create container: %w", err)
-		}
-		opts.ID = meta.ID
-
-		if err := r.Start(ctx, meta.ID); err != nil {
-			_ = r.Delete(context.Background(), meta.ID, true)
-			return -1, fmt.Errorf("start container: %w", err)
-		}
-		return 0, nil
-	}
-
-	// 2. 포그라운드 + 가상 터미널 X
-	if !opts.Terminal {
-		if opts.CreateOptions.Stdout == nil {
-			if opts.Stdout != nil {
-				opts.CreateOptions.Stdout = opts.Stdout
-			} else {
-				opts.CreateOptions.Stdout = os.Stdout
-			}
-		}
-		if opts.CreateOptions.Stderr == nil {
-			if opts.Stderr != nil {
-				opts.CreateOptions.Stderr = opts.Stderr
-			} else {
-				opts.CreateOptions.Stderr = os.Stderr
-			}
-		}
-
-		meta, err := r.Create(ctx, opts.CreateOptions)
-		if err != nil {
-			return -1, fmt.Errorf("create container: %w", err)
-		}
-		opts.ID = meta.ID
-
-		if err := r.Start(ctx, meta.ID); err != nil {
-			_ = r.Delete(context.Background(), meta.ID, true)
-			return -1, fmt.Errorf("start container: %w", err)
-		}
-
-		// Wait for process to exit
-		return r.waitForExit(ctx, meta.ID)
-	}
-
-	// 3. 포그라운드 + 가상 터미널
-	id := opts.ID
-	if id == "" {
-		newID, err := util.GenerateID()
-		if err != nil {
-			return -1, fmt.Errorf("generate id: %w", err)
-		}
-		id = newID
-		opts.ID = id
-		opts.CreateOptions.ID = id
-	}
-
-	rollback := NewRollbackTracker()
-	defer func() {
-		_ = rollback.Rollback()
-	}()
-
-	// Master FD를 위한 콘솔 소켓
-	consoleSock, err := runc.NewConsoleSocket("")
-	if err != nil {
-		return -1, fmt.Errorf("create console socket: %w", err)
-	}
-	defer consoleSock.Close() // defer 1
-
-	// 번들 디렉터리 및 rootfs 준비
-	b, err := r.bundleMgr.Create(id, opts.RootfsTarPath)
-	if err != nil {
-		return -1, fmt.Errorf("create bundle: %w", err)
-	}
-	rollback.Add(func() error {
-		return r.bundleMgr.Delete(id)
-	})
-
-	// 2. OCI config.json 생성 및 저장
-	spec, err := r.specBuilder.Build(oci.SpecOptions{
-		Args:     opts.Command,
-		Env:      opts.Env,
-		Terminal: true,
-		Hostname: opts.Hostname,
-		RootFS:   bundle.RootFSDirName,
-	})
-	if err != nil {
-		return -1, fmt.Errorf("build oci spec: %w", err)
-	}
-	if err := r.specBuilder.SaveToFile(spec, b.ConfigPath); err != nil {
-		return -1, fmt.Errorf("save config.json: %w", err)
-	}
-
-	// Master FD 백그라운드 수신 시작 (drainMaster는 master를 꺼내기 전 실패 경로에서만 호출)
-	masterCh, drainMaster := startMasterReceiver(consoleSock)
-
-	// runc create io 옵션 정의
-	ioOpts := &runc.IOOption{
-		ConsoleSocket: consoleSock.Path(),
-		RuncLogPath:   b.RuncLogPath,
-	}
-	if err := r.runcClient.Create(ctx, id, b.Path, b.PidFilePath, ioOpts); err != nil {
-		drainMaster()
-		return -1, fmt.Errorf("runc create: %w", err)
-	}
-	rollback.Add(func() error {
-		return r.runcClient.Delete(context.Background(), id, true)
-	})
-
-	// master 수신 (ctx 취소 / 타임아웃 시 waitMaster 내부에서 drain)
-	ptyMaster, err := waitMaster(ctx, masterCh, drainMaster)
-	if err != nil {
-		return -1, fmt.Errorf("receive pty master: %w", err)
-	}
-	defer ptyMaster.Close() // 마지막 정리 지점: 실제 close 시 slave 쪽 hangup
-
-	meta := &ContainerMetadata{
-		ID:         id,
-		Name:       opts.Name,
-		CreatedAt:  time.Now().UTC(),
-		Image:      opts.RootfsTarPath,
-		Command:    opts.Command,
-		BundlePath: b.Path,
-		State:      StateCreated,
-		Pid:        0,
-	}
-	if err := SaveMetadata(meta, b.MetaPath); err != nil {
-		return -1, fmt.Errorf("save container metadata: %w", err)
-	}
-
-	// 터미널 raw 모드로 전환
-	stdinFd := int(os.Stdin.Fd())
-	if term.IsTerminal(stdinFd) {
-		oldState, err := term.MakeRaw(stdinFd)
-		if err == nil {
-			defer term.Restore(stdinFd, oldState)
-		} // defer 터미널 표준 모드로 복구
-	}
-
-	stdoutDone := make(chan struct{})
-	// ptyMaster 참조하여 GC 회수 방지
-	go func() {
-		_, _ = io.Copy(ptyMaster, os.Stdin)
-	}()
-	go func() {
-		_, _ = io.Copy(os.Stdout, ptyMaster)
-		close(stdoutDone)
-	}()
-
-	// stopOutput : 출력 고루틴 정리. grace 동안 자연 종료(EIO)를 기다리고, 끝나지 않으면 read deadline으로
-	// 대기 중인 Read를 깨운 뒤 종료를 확인한다. 이미 끝났으면 즉시 반환하므로 여러 번 호출해도 안전하다.
-	stopOutput := func(grace time.Duration) {
-		select {
-		case <-stdoutDone:
-			return
-		case <-time.After(grace):
-		}
-		if err := ptyMaster.SetReadDeadline(time.Now()); err == nil {
-			<-stdoutDone
-		}
-		// deadline 설정 실패(non-pollable fd)면 Read를 깨울 수 없으므로 무한 대기하지 않고 진행한다
-	}
-	// term.Restore보다 나중에 등록 → 먼저 실행(LIFO): 모든 반환 경로에서 "출력 중단 → 터미널 복구 → master Close" 순서 보장
-	defer stopOutput(0)
-
-	// `runc start` 실행
-	if err := r.Start(ctx, id); err != nil {
-		return -1, fmt.Errorf("start container: %w", err)
-	}
-
-	// Start 성공: 롤백 함수 정리 (컨테이너가 RUNNING 상태로 진입함)
-	rollback.Commit()
-
-	// 종료 대기
-	exitCode, exitErr := r.waitForExit(ctx, id)
-
-	// 컨테이너 종료 후 PTY 버퍼에 남은 출력이 os.Stdout으로 모두 복사되기를(EIO 자연 종료) 우선 기다린다.
-	// 시간 내에 끝나지 않으면(slave를 쥔 프로세스가 남아 있는 등) read deadline으로 대기 중인 Read를 깨워
-	// 출력 고루틴이 반드시 종료되도록 한다. master는 non-blocking(netpoller 등록)이라 deadline이 즉시 반영된다.
-	stopOutput(ptyDrainTimeout)
-
-	return exitCode, exitErr
-}
-
-// waitForExit 컨테이너 종료 확인 함수
-func (r *runcRuntime) waitForExit(ctx context.Context, id string) (int, error) {
-	ticker := time.NewTicker(100 * time.Millisecond)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return -1, ctx.Err()
-		case <-ticker.C:
-			state, err := r.runcClient.State(ctx, id)
-			if err != nil || state.Status == runc.StatusStopped {
-				return 0, nil
-			}
-		}
-	}
-}
-
-// Stop : `runc stop` 최초 신호는 SIGTERM 시간 초과하면 SIGKILL 신호 전송
-func (r *runcRuntime) Stop(ctx context.Context, id string, timeout time.Duration) error {
-	b, err := r.bundleMgr.Get(id)
-	if err != nil {
+	if err := meta.TransitionTo(StateRunning); err != nil {
 		return err
 	}
-
-	meta, err := r.Get(ctx, id)
-	if err != nil {
-		return fmt.Errorf("get metadata: %w", err)
-	}
-
-	if meta.State == StateStopped {
-		return nil
-	}
-
-	if timeout <= 0 {
-		timeout = 10 * time.Second
-	}
-
-	// Send SIGTERM
-	_ = r.runcClient.Kill(ctx, id, "SIGTERM")
-
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		state, err := r.runcClient.State(ctx, id)
-		if err != nil || state.Status == runc.StatusStopped {
-			meta.State = StateStopped
-			return SaveMetadata(meta, b.MetaPath)
-		}
-		time.Sleep(200 * time.Millisecond)
-	}
-
-	// 시간 아웃시 SIGKILL 신호로 재전송
-	_ = r.runcClient.Kill(ctx, id, "SIGKILL")
-	meta.State = StateStopped
-	return SaveMetadata(meta, b.MetaPath)
+	meta.Pid = pid
+	return r.store.Put(meta)
 }
 
-// Delete runc 관련 리소스(cgroups 등) 제거 및 번들 디렉터리 제거
-func (r *runcRuntime) Delete(ctx context.Context, id string, force bool) error {
-	meta, err := r.Get(ctx, id)
+// initPid : `runc create`가 pid 파일에 기록한 컨테이너 init 프로세스의 (호스트 기준) PID를 읽는다
+func (r *runcRuntime) initPid(id string) (int, error) {
+	path := r.bundleMgr.Layout().PidFilePath(id)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0, fmt.Errorf("read pid file: %w", err)
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil || pid <= 0 {
+		return 0, fmt.Errorf("invalid pid file %s: %q", path, strings.TrimSpace(string(data)))
+	}
+	return pid, nil
+}
+
+// remove : 컨테이너에 딸린 리소스를 "runc → 번들 → 레코드" 순서로 제거한다.
+// 레코드를 마지막에 지우므로 도중에 실패하거나 중단되어도 컨테이너가 목록에 남아 다시 rm할 수 있다.
+// 그래서 이미 없는 runc 컨테이너 / 번들은 에러가 아니다 (생성 도중 중단된 컨테이너도 같은 경로로 정리된다).
+//
+// 반대로 어느 단계든 "없어서"가 아닌 이유로 실패하면 거기서 멈추고 에러를 반환한다. 치우지 못한 리소스를 두고
+// 다음 단계로 넘어가면, 살아 있는 runc 컨테이너를 가리키던 번들과 레코드가 사라져 다시 정리할 수 없게 된다.
+func (r *runcRuntime) remove(ctx context.Context, id string, force bool) error {
+	unlock, err := r.store.Lock(id)
+	if err != nil {
+		return fmt.Errorf("get container %q: %w", id, err)
+	}
+	defer unlock() // 레코드가 지워졌으면 잠금 파일도 함께 정리된다
+
+	meta, err := r.get(ctx, id)
 	if err != nil {
 		return fmt.Errorf("get container %q: %w", id, err)
 	}
@@ -557,62 +363,66 @@ func (r *runcRuntime) Delete(ctx context.Context, id string, force bool) error {
 		return fmt.Errorf("container %q is running, use -f to force remove", id)
 	}
 
-	// runc 리소스 제거
-	_ = r.runcClient.Delete(ctx, id, force)
+	// runc 리소스 제거 (이미 없는 것만 정상으로 본다)
+	if err := r.runcClient.Delete(ctx, id, force); err != nil && !errors.Is(err, runc.ErrNotFound) {
+		return fmt.Errorf("delete runc container: %w", err)
+	}
 
 	// 번들 디렉터리 제거
-	return r.bundleMgr.Delete(id)
+	if err := r.bundleMgr.Delete(id); err != nil {
+		return fmt.Errorf("delete bundle: %w", err)
+	}
+
+	// 메타데이터 레코드 제거 (이 시점부터 컨테이너는 존재하지 않는다)
+	return r.store.Delete(id)
 }
 
-// Get 컨테이너 메타데이터 갱신 후 반환
-func (r *runcRuntime) Get(ctx context.Context, id string) (*ContainerMetadata, error) {
-	b, err := r.bundleMgr.Get(id)
+// get : 저장된 메타데이터에 runc에서 관측한 실제 상태를 반영하여 반환한다.
+// 읽기 전용이다: 관측 결과는 반환값에만 반영되고 저장하지 않는다 (저장은 상태를 바꾸는 명령의 책임).
+func (r *runcRuntime) get(ctx context.Context, id string) (*ContainerMetadata, error) {
+	meta, err := r.store.Get(id)
 	if err != nil {
 		return nil, err
 	}
-
-	meta, err := LoadMetadata(b.MetaPath)
-	if err != nil {
-		return nil, fmt.Errorf("load metadata: %w", err)
-	}
-
-	// Sync with runc state if possible
-	if state, err := r.runcClient.State(ctx, id); err == nil {
-		changed := false
-		if state.Status == runc.StatusRunning && (meta.State != StateRunning || meta.Pid != state.Pid) {
-			meta.State = StateRunning
-			meta.Pid = state.Pid
-			changed = true
-		} else if state.Status == runc.StatusStopped && meta.State != StateStopped {
-			meta.State = StateStopped
-			changed = true
-		}
-
-		if changed {
-			_ = SaveMetadata(meta, b.MetaPath)
-		}
-	}
-
+	r.observe(ctx, meta)
 	return meta, nil
 }
 
-// List : 모든 컨테이너에 대해서 Get 수행
+// observe : runc 상태를 조회해 메타데이터에 반영한다 (조회 실패 또는 created/creating 등은 저장된 상태 유지)
+//
+// 예외: 저장된 상태는 RUNNING인데 runc가 그 컨테이너를 아예 모르면(runc.ErrNotFound) STOPPED로 본다.
+// 재부팅으로 runc 상태 디렉터리(/run/runc, tmpfs)가 비워지면 프로세스는 이미 없는데 레코드만 RUNNING으로 남는다.
+// 이것을 그대로 믿으면 죽은 컨테이너가 계속 실행 중으로 보이고 rm이 -f를 요구하게 된다.
+// CREATED에는 적용하지 않는다: 생성 중에는 레코드가 runc 컨테이너보다 먼저 만들어지므로 "runc가 모름"이 정상이다.
+func (r *runcRuntime) observe(ctx context.Context, meta *ContainerMetadata) {
+	state, err := r.runcClient.State(ctx, meta.ID)
+	if err != nil {
+		if errors.Is(err, runc.ErrNotFound) && meta.State == StateRunning {
+			meta.ApplyObserved(StateStopped, 0)
+		}
+		return
+	}
+	switch state.Status {
+	case runc.StatusRunning:
+		meta.ApplyObserved(StateRunning, state.Pid)
+	case runc.StatusStopped:
+		meta.ApplyObserved(StateStopped, 0)
+	}
+}
+
+// List : 저장소의 모든 컨테이너에 runc 관측 상태를 반영하여 반환한다 (all이 false면 실행 중인 것만)
 func (r *runcRuntime) List(ctx context.Context, all bool) ([]*ContainerMetadata, error) {
-	ids, err := r.bundleMgr.List()
+	metas, err := r.store.List()
 	if err != nil {
 		return nil, err
 	}
 
 	var list []*ContainerMetadata
-	for _, id := range ids {
-		meta, err := r.Get(ctx, id)
-		if err != nil {
-			return nil, fmt.Errorf("컨테이너 %q 조회 실패: %w", id, err)
-		}
+	for _, meta := range metas {
+		r.observe(ctx, meta)
 		if all || meta.State == StateRunning {
 			list = append(list, meta)
 		}
 	}
-
 	return list, nil
 }

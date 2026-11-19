@@ -11,14 +11,14 @@ const (
 	// ContainersDirName : Bundle 디렉터리가 저장되는 디렉터리 이름
 	ContainersDirName = "containers"
 
+	// StateDirName : 컨테이너 메타데이터(레코드, 잠금 파일)가 저장되는 디렉터리 이름. 번들과 분리되어 store 패키지가 소유한다.
+	StateDirName = "state"
+
 	// RootFSDirName : Bundle 디렉터리에 저장되는 RootFS 디렉터리 이름 (OCI Bundle 주요 폴더)
 	RootFSDirName = "rootfs"
 
 	// ConfigFileName : 컨테이너 설정 저장하는 파일 이름 (OCI Bundle 주요 파일)
 	ConfigFileName = "config.json"
-
-	// MetadataFileName : 메타데이터 저장하는 파일 이름
-	MetadataFileName = "metadata.json"
 
 	// PidFileName : PID 저장 파일
 	PidFileName = "container.pid"
@@ -48,6 +48,11 @@ func (l *Layout) ContainersDir() string {
 	return filepath.Join(l.rootDir, ContainersDirName)
 }
 
+// StateDir : /var/lib/gocker/state 반환 (메타데이터 저장소 루트)
+func (l *Layout) StateDir() string {
+	return filepath.Join(l.rootDir, StateDirName)
+}
+
 // BundleDir : /var/lib/gocker/containers/<container-id> 반환
 func (l *Layout) BundleDir(id string) string {
 	return filepath.Join(l.ContainersDir(), id)
@@ -61,11 +66,6 @@ func (l *Layout) RootFSDir(id string) string {
 // ConfigPath : /var/lib/gocker/containers/<container-id>/config.json 반환
 func (l *Layout) ConfigPath(id string) string {
 	return filepath.Join(l.BundleDir(id), ConfigFileName)
-}
-
-// MetadataPath : /var/lib/gocker/containers/<container-id>/metadata.json 반환
-func (l *Layout) MetadataPath(id string) string {
-	return filepath.Join(l.BundleDir(id), MetadataFileName)
 }
 
 // PidFilePath : /var/lib/gocker/containers/<container-id>/container.pid 반환

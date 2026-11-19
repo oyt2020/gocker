@@ -3,10 +3,12 @@ package cli
 import (
 	"context"
 	"fmt"
+	"os"
 	"testing"
 	"time"
 
 	ctd "github.com/oyt2020/gocker/pkg/containerd"
+	"github.com/oyt2020/gocker/pkg/image"
 	"github.com/oyt2020/gocker/pkg/runtime"
 )
 
@@ -53,9 +55,9 @@ func (m *mockRuntime) Start(ctx context.Context, id string) error {
 	return nil
 }
 
-func (m *mockRuntime) Run(ctx context.Context, opts runtime.RunOptions) (int, error) {
+func (m *mockRuntime) Run(ctx context.Context, opts runtime.RunOptions) (runtime.RunResult, error) {
 	m.runOpts = append(m.runOpts, opts)
-	return 0, nil
+	return runtime.RunResult{ID: "c0ffee000001"}, nil
 }
 
 func (m *mockRuntime) Stop(ctx context.Context, id string, timeout time.Duration) error {
@@ -143,72 +145,145 @@ func TestDispatcher_PsAndLifecycle(t *testing.T) {
 		t.Fatalf("ps -q failed: %v", err)
 	}
 
-	// gocker stop test-box (should resolve name)
+	// gocker stop test-box (이름/ID 해석은 런타임의 책임: CLI는 입력을 그대로 넘긴다)
 	if err := d.Execute(context.Background(), []string{"stop", "test-box"}); err != nil {
 		t.Fatalf("stop failed: %v", err)
 	}
-	if len(rt.stoppedIDs) != 1 || rt.stoppedIDs[0] != "c8a19d3f10be" {
-		t.Fatalf("expected stopped id c8a19d3f10be, got %v", rt.stoppedIDs)
+	if len(rt.stoppedIDs) != 1 || rt.stoppedIDs[0] != "test-box" {
+		t.Fatalf("expected stop target test-box, got %v", rt.stoppedIDs)
 	}
 
 	// gocker start test-box
 	if err := d.Execute(context.Background(), []string{"start", "test-box"}); err != nil {
 		t.Fatalf("start failed: %v", err)
 	}
-	if len(rt.startedIDs) != 1 || rt.startedIDs[0] != "c8a19d3f10be" {
-		t.Fatalf("expected started id c8a19d3f10be, got %v", rt.startedIDs)
+	if len(rt.startedIDs) != 1 || rt.startedIDs[0] != "test-box" {
+		t.Fatalf("expected start target test-box, got %v", rt.startedIDs)
 	}
 
 	// gocker rm test-box
 	if err := d.Execute(context.Background(), []string{"rm", "test-box"}); err != nil {
 		t.Fatalf("rm failed: %v", err)
 	}
-	if len(rt.deletedIDs) != 1 || rt.deletedIDs[0] != "c8a19d3f10be" {
-		t.Fatalf("expected deleted id c8a19d3f10be, got %v", rt.deletedIDs)
+	if len(rt.deletedIDs) != 1 || rt.deletedIDs[0] != "test-box" {
+		t.Fatalf("expected rm target test-box, got %v", rt.deletedIDs)
 	}
 }
 
-func TestDispatcher_ResolveContainerID_SecurityAndAmbiguity(t *testing.T) {
-	rt := &mockRuntime{
-		containers: []*runtime.ContainerMetadata{
-			{
-				ID:    "c8a19d3f10be",
-				Name:  "box-1",
-				State: runtime.StateStopped,
-			},
-			{
-				ID:    "c8a1deadbeef",
-				Name:  "box-2",
-				State: runtime.StateStopped,
-			},
-		},
-	}
+// CLI는 컨테이너 참조를 해석하지 않는다: 여러 대상을 순서대로 넘기고, 런타임 에러가 나면 거기서 멈춘다
+func TestDispatcher_PassesTargetsThroughAndStopsOnError(t *testing.T) {
+	rt := &mockRuntime{}
 	d := NewDispatcher(rt, nil)
 
-	// 1. Path traversal / non-existent targets must fail without calling Delete
-	for _, target := range []string{".", "..", "../containers", "non-existent"} {
-		if err := d.Execute(context.Background(), []string{"rm", target}); err == nil {
-			t.Fatalf("expected error for rm %q, got nil", target)
-		}
+	if err := d.Execute(context.Background(), []string{"rm", "-f", "c8a1", "box-2", "../etc"}); err != nil {
+		t.Fatalf("rm failed: %v", err)
 	}
-	if len(rt.deletedIDs) != 0 {
-		t.Fatalf("expected no deletions for invalid targets, got %v", rt.deletedIDs)
+	if got := fmt.Sprint(rt.deletedIDs); got != "[c8a1 box-2 ../etc]" {
+		t.Fatalf("targets must reach the runtime unmodified, got %s", got)
 	}
 
-	// 2. Ambiguous prefix "c8a1" matches both containers -> must return error
-	if err := d.Execute(context.Background(), []string{"rm", "c8a1"}); err == nil {
-		t.Fatalf("expected ambiguous prefix error for 'c8a1', got nil")
+	rt.deleteErr = fmt.Errorf("container not found")
+	rt.deletedIDs = nil
+	if err := d.Execute(context.Background(), []string{"rm", "a", "b"}); err == nil {
+		t.Fatalf("expected runtime error to propagate")
 	}
 	if len(rt.deletedIDs) != 0 {
-		t.Fatalf("expected no deletions on ambiguous prefix, got %v", rt.deletedIDs)
+		t.Fatalf("expected no successful deletions, got %v", rt.deletedIDs)
+	}
+}
+
+func TestDispatcher_CreateDelegatesIDAndImage(t *testing.T) {
+	rt := &mockRuntime{}
+	d := NewDispatcher(rt, nil)
+
+	if err := d.Execute(context.Background(), []string{"create", "--name", "box", "alpine", "echo", "hi"}); err != nil {
+		t.Fatalf("create failed: %v", err)
+	}
+	if len(rt.createdOpts) != 1 {
+		t.Fatalf("expected 1 create call, got %d", len(rt.createdOpts))
+	}
+	opts := rt.createdOpts[0]
+	if opts.ID != "" {
+		t.Fatalf("CLI must not generate container ID, got %q", opts.ID)
+	}
+	if opts.RootfsTarPath != image.DefaultRootFS {
+		t.Fatalf("expected rootfs %q, got %q", image.DefaultRootFS, opts.RootfsTarPath)
+	}
+	if len(opts.Command) != 2 || opts.Command[0] != "echo" || opts.Command[1] != "hi" {
+		t.Fatalf("unexpected command %v", opts.Command)
+	}
+}
+
+func TestDispatcher_RunStdioPolicy(t *testing.T) {
+	rt := &mockRuntime{}
+	d := NewDispatcher(rt, nil)
+
+	// detach: 출력 대상을 지정하지 않아야 한다 (런타임이 container.log로 기록)
+	if err := d.Execute(context.Background(), []string{"run", "-d", "alpine", "sleep", "1"}); err != nil {
+		t.Fatalf("run -d failed: %v", err)
+	}
+	// foreground: 현재 프로세스의 stdout/stderr로 연결해야 한다
+	if err := d.Execute(context.Background(), []string{"run", "--rm", "alpine", "echo", "hi"}); err != nil {
+		t.Fatalf("run failed: %v", err)
 	}
 
-	// 3. Unique prefix "c8a19d" matches only box-1 -> must succeed with canonical ID
-	if err := d.Execute(context.Background(), []string{"rm", "c8a19d"}); err != nil {
-		t.Fatalf("expected rm with unique prefix 'c8a19d' to succeed, got %v", err)
+	if len(rt.runOpts) != 2 {
+		t.Fatalf("expected 2 run calls, got %d", len(rt.runOpts))
 	}
-	if len(rt.deletedIDs) != 1 || rt.deletedIDs[0] != "c8a19d3f10be" {
-		t.Fatalf("expected canonical ID 'c8a19d3f10be', got %v", rt.deletedIDs)
+	detached, fg := rt.runOpts[0], rt.runOpts[1]
+
+	if detached.ID != "" || fg.ID != "" {
+		t.Fatalf("CLI must not generate container ID")
+	}
+	if detached.Stdout != nil || detached.Stderr != nil || detached.Stdin != nil {
+		t.Fatalf("detached run must not attach stdio, got %+v", detached.CreateOptions)
+	}
+	if fg.Stdout == nil || fg.Stderr == nil {
+		t.Fatalf("foreground run must attach stdout/stderr")
+	}
+	if fg.Stdin != nil {
+		t.Fatalf("non-tty foreground run must not forward stdin")
+	}
+}
+
+// -i: TTY가 없어도 표준 입력을 컨테이너에 연결한다. detach에서는 연결하지 않는다.
+func TestDispatcher_RunInteractiveStdin(t *testing.T) {
+	rt := &mockRuntime{}
+	d := NewDispatcher(rt, nil)
+	ctx := context.Background()
+
+	if err := d.Execute(ctx, []string{"run", "-i", "--rm", "alpine", "cat"}); err != nil {
+		t.Fatalf("run -i failed: %v", err)
+	}
+	if err := d.Execute(ctx, []string{"run", "-d", "-i", "alpine", "cat"}); err != nil {
+		t.Fatalf("run -d -i failed: %v", err)
+	}
+	if len(rt.runOpts) != 2 {
+		t.Fatalf("expected 2 run calls, got %d", len(rt.runOpts))
+	}
+	interactive, detached := rt.runOpts[0], rt.runOpts[1]
+
+	if interactive.Stdin != os.Stdin {
+		t.Fatalf("run -i must forward the process stdin, got %v", interactive.Stdin)
+	}
+	if interactive.Terminal {
+		t.Fatalf("run -i must not allocate a terminal")
+	}
+	if detached.Stdin != nil {
+		t.Fatalf("detached run must not forward stdin even with -i")
+	}
+}
+
+// -d --rm: 시작 직후 삭제되는 컨테이너를 만들지 않도록 런타임을 호출하기 전에 거부한다
+func TestDispatcher_RunRejectsDetachWithRm(t *testing.T) {
+	rt := &mockRuntime{}
+	d := NewDispatcher(rt, nil)
+
+	if err := d.Execute(context.Background(), []string{"run", "-d", "--rm", "alpine", "sleep", "1"}); err == nil {
+		t.Fatalf("expected error for run -d --rm")
+	}
+	if len(rt.runOpts) != 0 {
+		t.Fatalf("runtime must not be called for a rejected run, got %d call(s)", len(rt.runOpts))
 	}
 }
 

@@ -37,6 +37,22 @@ expect_contains() {
   fi
 }
 
+# expect_exit <설명> <기대 종료 코드> <명령...> : 명령이 정확히 그 종료 코드로 끝나야 한다
+expect_exit() {
+  local desc="$1" want="$2"; shift 2
+  n=$((n + 1))
+  local log="$TMP/$n.log"
+  timeout 60 "$@" >"$log" 2>&1
+  local rc=$?
+  if [ $rc -eq "$want" ]; then
+    echo "PASS  $desc"
+  else
+    echo "FAIL  $desc (exit=$rc, 기대=$want)"
+    echo "::group::$desc 출력"; cat "$log"; echo "::endgroup::"
+    FAILED+=("$desc  ->  $* (exit=$rc, 기대=$want)")
+  fi
+}
+
 # --- 1. create → start → stop → rm ---
 run_case "create" $GOCKER create alpine sleep 300
 CID=$LAST_OUT
@@ -59,6 +75,126 @@ expect_contains "run 포그라운드 --rm" "hello" $GOCKER run --rm alpine echo 
 # --- 4. run -t (포그라운드 + 가상 터미널) --rm ---
 # CI에는 실제 TTY가 없으므로 script(1)로 PTY를 붙여 터미널 경로를 검증한다
 expect_contains "run -t 포그라운드 --rm" "tty-ok" script -qec "$GOCKER run -t --rm alpine echo tty-ok" /dev/null
+
+# --- 5. 포그라운드 run 종료 코드 전파 (subreaper + wait) ---
+expect_exit "run 종료 코드 전파" 7 $GOCKER run --rm alpine sh -c 'exit 7'
+expect_exit "run -t 종료 코드 전파" 9 script -qec "$GOCKER run -t --rm alpine sh -c 'exit 9'" /dev/null
+
+# 시그널로 죽은 컨테이너는 128+시그널 번호. 포그라운드 run을 백그라운드 잡으로 띄우고 밖에서 stop한다.
+# sleep은 컨테이너의 PID 1이라 SIGTERM을 무시하므로 타임아웃 뒤 SIGKILL(9)로 종료된다 → 137
+$GOCKER run --name e2e-sig alpine sleep 300 >"$TMP/sig.log" 2>&1 &
+SIG_JOB=$!
+for _ in $(seq 1 50); do
+  $GOCKER ps | grep -q e2e-sig && break
+  sleep 0.1
+done
+run_case "포그라운드 컨테이너 stop" $GOCKER stop -t 1 e2e-sig
+wait $SIG_JOB
+SIG_RC=$?
+n=$((n + 1))
+if [ $SIG_RC -eq 137 ]; then
+  echo "PASS  run 시그널 종료 코드 (SIGKILL=137)"
+else
+  echo "FAIL  run 시그널 종료 코드 (exit=$SIG_RC, 기대=137)"
+  echo "::group::run 출력"; cat "$TMP/sig.log"; echo "::endgroup::"
+  FAILED+=("run 시그널 종료 코드  ->  exit=$SIG_RC, 기대=137")
+fi
+run_case "포그라운드 컨테이너 rm" $GOCKER rm e2e-sig
+
+# --- 6. 이미 스스로 종료한 컨테이너 stop (신호 없이 성공해야 한다) → rm ---
+run_case "run -d (즉시 종료)" $GOCKER run -d alpine true
+XID=$LAST_OUT
+sleep 1
+run_case "종료된 컨테이너 stop" $GOCKER stop -t 2 "$XID"
+run_case "종료된 컨테이너 rm" $GOCKER rm "$XID"
+
+# --- 7. stop 도중 Ctrl+C(SIGINT): 곧바로 실패로 반환하고, 살아 있는 컨테이너를 STOPPED로 기록하지 않는다 ---
+run_case "run -d (SIGTERM 무시)" $GOCKER run -d alpine sleep 300
+IID=$LAST_OUT
+# sleep은 PID 1이라 SIGTERM을 무시하므로 stop은 30초 대기에 들어간다. 1초 뒤 SIGINT를 보내 중단시킨다.
+INT_T0=$SECONDS
+timeout -s INT 1 $GOCKER stop -t 30 "$IID" >"$TMP/int.log" 2>&1
+INT_RC=$?
+INT_ELAPSED=$((SECONDS - INT_T0))
+n=$((n + 1))
+if [ $INT_RC -ne 0 ] && [ $INT_ELAPSED -lt 10 ]; then
+  echo "PASS  stop 도중 SIGINT → 곧바로 실패로 반환 (${INT_ELAPSED}s)"
+else
+  echo "FAIL  stop 도중 SIGINT (exit=$INT_RC, ${INT_ELAPSED}s)"
+  echo "::group::stop 출력"; cat "$TMP/int.log"; echo "::endgroup::"
+  FAILED+=("stop 도중 SIGINT  ->  exit=$INT_RC, ${INT_ELAPSED}s")
+fi
+expect_contains "취소된 stop 후에도 running" "$IID" $GOCKER ps -q
+run_case "취소된 stop 후 rm -f" $GOCKER rm -f "$IID"
+
+# --- 8. run -d --rm 은 거부된다 (시작 직후 삭제되는 컨테이너를 만들지 않는다) ---
+expect_exit "run -d --rm 거부" 1 $GOCKER run -d --rm alpine sleep 300
+n=$((n + 1))
+if [ -z "$($GOCKER ps -a -q)" ]; then
+  echo "PASS  거부된 run은 컨테이너를 남기지 않음"
+else
+  echo "FAIL  거부된 run이 컨테이너를 남김"
+  FAILED+=("거부된 run이 컨테이너를 남김")
+fi
+
+# --- 9. 이름은 유일해야 한다: 중복 생성 거부, 삭제 후 재사용 ---
+run_case "create --name" $GOCKER create --name e2e-dup alpine sleep 300
+expect_exit "같은 이름으로 create 거부" 1 $GOCKER create --name e2e-dup alpine sleep 300
+expect_exit "같은 이름으로 run 거부" 1 $GOCKER run -d --name e2e-dup alpine sleep 300
+n=$((n + 1))
+DUP_COUNT=$($GOCKER ps -a -q | wc -l)
+if [ "$DUP_COUNT" -eq 1 ]; then
+  echo "PASS  거부된 생성은 컨테이너를 남기지 않음"
+else
+  echo "FAIL  이름 중복 거부 후 컨테이너 수=$DUP_COUNT (기대=1)"
+  FAILED+=("이름 중복 거부 후 컨테이너 수=$DUP_COUNT")
+fi
+run_case "이름으로 rm" $GOCKER rm e2e-dup
+run_case "삭제 후 같은 이름 재사용" $GOCKER create --name e2e-dup alpine sleep 300
+run_case "재사용한 컨테이너 rm" $GOCKER rm e2e-dup
+
+# --- 10. 포그라운드 run 중 gocker가 시그널을 받으면: 컨테이너를 끝내고(SIGTERM → 대기 → SIGKILL) 그 종료 코드로 종료 ---
+# fg_signal <설명> <컨테이너 이름> <시그널> <기대 종료 코드> <출력에 있어야 할 문자열 또는 ''> <gocker run 인자...>
+fg_signal() {
+  local desc="$1" name="$2" sig="$3" want="$4" pat="$5"; shift 5
+  n=$((n + 1))
+  local log="$TMP/$n.log"
+  $GOCKER run --name "$name" "$@" >"$log" 2>&1 </dev/null &
+  local job=$!
+  for _ in $(seq 1 50); do
+    $GOCKER ps | grep -q "$name" && break
+    sleep 0.1
+  done
+  sleep 0.3 # 컨테이너 안의 셸이 trap을 설치할 시간
+  kill -"$sig" "$job"
+  wait "$job"
+  local rc=$?
+  if [ $rc -eq "$want" ] && { [ -z "$pat" ] || grep -q -- "$pat" "$log"; }; then
+    echo "PASS  $desc"
+  else
+    echo "FAIL  $desc (exit=$rc, 기대=$want${pat:+, 출력에 '$pat' 필요})"
+    echo "::group::$desc 출력"; cat "$log"; echo "::endgroup::"
+    FAILED+=("$desc  ->  exit=$rc, 기대=$want")
+  fi
+}
+# SIGTERM / SIGINT 를 받으면 표시를 남기고 종료 코드 7로 끝나는 컨테이너 (정상 정리를 흉내)
+TRAP_SH='trap "echo TRAP-HANDLED; exit 7" TERM INT; while :; do sleep 0.2; done'
+
+fg_signal "run 중 SIGTERM → 컨테이너가 정리 후 종료 (7)" e2e-fg-term TERM 7 TRAP-HANDLED alpine sh -c "$TRAP_SH"
+run_case "SIGTERM 으로 끝난 컨테이너는 -f 없이 rm" $GOCKER rm e2e-fg-term
+fg_signal "run 중 SIGINT → 컨테이너가 정리 후 종료 (7)" e2e-fg-int INT 7 TRAP-HANDLED alpine sh -c "$TRAP_SH"
+run_case "SIGINT 로 끝난 컨테이너는 -f 없이 rm" $GOCKER rm e2e-fg-int
+# sleep은 PID 1이라 SIGTERM을 무시한다 → 유예 시간 뒤 SIGKILL → 137
+fg_signal "run 중 SIGTERM, 컨테이너가 무시 → SIGKILL (137)" e2e-fg-kill TERM 137 '' alpine sleep 300
+run_case "SIGKILL 로 끝난 컨테이너는 -f 없이 rm" $GOCKER rm e2e-fg-kill
+fg_signal "run --rm 중 SIGTERM → 정리 기회를 준 뒤 삭제 (7)" e2e-fg-rm TERM 7 TRAP-HANDLED --rm alpine sh -c "$TRAP_SH"
+n=$((n + 1))
+if [ -z "$($GOCKER ps -a -q)" ]; then
+  echo "PASS  시그널 테스트 후 남은 컨테이너 없음"
+else
+  echo "FAIL  시그널 테스트 후 컨테이너가 남음"
+  FAILED+=("시그널 테스트 후 컨테이너가 남음")
+fi
 
 # --- 결과 ---
 echo
